@@ -2766,24 +2766,27 @@ BOOL SubscribeToSymbol(LPCTSTR pszTicker)
 		symbol, exchange);
 	OutputDebugString(extractLog);
 
-	// Send subscription message in the FLAT/LEGACY format that the OpenAlgo
-	// server actually accepts. The newer {"mode":"ltp","instruments":[...]}
-	// shape is rejected by the running server with
-	// {"code":"INVALID_PARAMETERS","message":"At least one symbol must be specified"}.
-	// Mode 1 = LTP (every tick), 2 = Quote, 3 = Depth.
-	CString subMsg;
-	subMsg.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
+	// Send TWO subscriptions per symbol in the flat/legacy server format:
+	//   Mode 1 (LTP)   = every-tick price - feeds the chart's live current bar
+	//   Mode 2 (Quote) = OHLC + volume on significant changes - feeds the
+	//                    Realtime Quote Window (Last/Open/High/Low/Volume)
+	// Without both, either the chart lags (no LTP ticks) or the quote window
+	// shows zeros for everything except Last.
+	CString subLtp, subQuote;
+	subLtp.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
+		(LPCTSTR)symbol, (LPCTSTR)exchange);
+	subQuote.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":2}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
 
-	CString msgLog;
-	msgLog.Format(_T("OpenAlgo: SubscribeToSymbol - Sending: %s"), subMsg);
-	OutputDebugString(msgLog);
-
-	BOOL result = SendWebSocketFrame(subMsg);
+	BOOL r1 = SendWebSocketFrame(subLtp);
+	BOOL r2 = SendWebSocketFrame(subQuote);
 
 	CString resultLog;
-	resultLog.Format(_T("OpenAlgo: SubscribeToSymbol - SendWebSocketFrame returned %d"), result);
+	resultLog.Format(_T("OpenAlgo: SubscribeToSymbol %s -- ltp_send=%d quote_send=%d"),
+		(LPCTSTR)pszTicker, r1, r2);
 	OutputDebugString(resultLog);
+
+	BOOL result = (r1 || r2);
 
 	return result;
 }
@@ -2797,12 +2800,15 @@ BOOL UnsubscribeFromSymbol(LPCTSTR pszTicker)
 	CString symbol = GetCleanSymbol(pszTicker);
 	CString exchange = GetExchangeFromTicker(pszTicker);
 	
-	// Match the same flat/legacy shape the server expects (mode 1 = LTP)
-	CString unsubMsg;
-	unsubMsg.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
+	// Mirror SubscribeToSymbol's dual subscribe: unsubscribe both modes
+	CString unsubLtp, unsubQuote;
+	unsubLtp.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
-	
-	return SendWebSocketFrame(unsubMsg);
+	unsubQuote.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":2}"),
+		(LPCTSTR)symbol, (LPCTSTR)exchange);
+	BOOL r1 = SendWebSocketFrame(unsubLtp);
+	BOOL r2 = SendWebSocketFrame(unsubQuote);
+	return (r1 || r2);
 }
 
 void SubscribePendingSymbols(void)
@@ -2850,7 +2856,27 @@ BOOL ProcessWebSocketData(void)
 			if (InitializeWebSocket())
 			{
 				OutputDebugString(_T("OpenAlgo: *** AUTO-RECONNECT SUCCESSFUL! ***"));
-				return TRUE; // Continue processing
+
+				// Re-issue every previously-active subscription. We deliberately
+				// keep g_SubscribedSymbols intact across disconnects so that the
+				// list of symbols the user is viewing survives a brief WS drop.
+				EnterCriticalSection(&g_WebSocketCriticalSection);
+				int reSubbed = 0;
+				POSITION rpos = g_SubscribedSymbols.GetStartPosition();
+				while (rpos != NULL)
+				{
+					CString sym;
+					BOOL b;
+					g_SubscribedSymbols.GetNextAssoc(rpos, sym, b);
+					SubscribeToSymbol(sym);
+					reSubbed++;
+				}
+				LeaveCriticalSection(&g_WebSocketCriticalSection);
+
+				CString resubLog;
+				resubLog.Format(_T("OpenAlgo: Re-subscribed %d symbol(s) after reconnect"), reSubbed);
+				OutputDebugString(resubLog);
+				return TRUE;
 			}
 			else
 			{
@@ -3077,6 +3103,55 @@ BOOL ProcessWebSocketData(void)
 					ltp = (float)_tstof(val);
 				}
 
+				// Extract Mode 2 (Quote) fields: open / high / low / close /
+				// volume. Mode 1 (LTP) frames don't have these so the locals
+				// stay 0, and we'll preserve any earlier values when we copy
+				// into the cache (see below).
+				{
+					int p = data.Find(_T("\"open\":"));
+					if (p >= 0) {
+						p += 7;
+						int e = data.Find(_T(","), p);
+						if (e < 0) e = data.Find(_T("}"), p);
+						open = (float)_tstof(data.Mid(p, e - p));
+					}
+					p = data.Find(_T("\"high\":"));
+					if (p >= 0) {
+						p += 7;
+						int e = data.Find(_T(","), p);
+						if (e < 0) e = data.Find(_T("}"), p);
+						high = (float)_tstof(data.Mid(p, e - p));
+					}
+					p = data.Find(_T("\"low\":"));
+					if (p >= 0) {
+						p += 6;
+						int e = data.Find(_T(","), p);
+						if (e < 0) e = data.Find(_T("}"), p);
+						low = (float)_tstof(data.Mid(p, e - p));
+					}
+					p = data.Find(_T("\"close\":"));
+					if (p >= 0) {
+						p += 8;
+						int e = data.Find(_T(","), p);
+						if (e < 0) e = data.Find(_T("}"), p);
+						close = (float)_tstof(data.Mid(p, e - p));
+					}
+					p = data.Find(_T("\"volume\":"));
+					if (p >= 0) {
+						p += 9;
+						int e = data.Find(_T(","), p);
+						if (e < 0) e = data.Find(_T("}"), p);
+						volume = (float)_tstof(data.Mid(p, e - p));
+					}
+					p = data.Find(_T("\"oi\":"));
+					if (p >= 0) {
+						p += 5;
+						int e = data.Find(_T(","), p);
+						if (e < 0) e = data.Find(_T("}"), p);
+						oi = (float)_tstof(data.Mid(p, e - p));
+					}
+				}
+
 				// Extract last trade quantity - try both field names
 				// Legacy format: "last_trade_quantity":100
 				// Docs format: "ltq":100
@@ -3143,22 +3218,28 @@ BOOL ProcessWebSocketData(void)
 				// Extract other fields similarly...
 				// (Simplified implementation - you could add more fields)
 
-				// Update cache (for GetRecentInfo() compatibility)
+				// Update cache (for GetRecentInfo() compatibility).
+				// Mode 1 (LTP) frames carry only ltp+timestamp; Mode 2 (Quote)
+				// frames carry full OHLC+volume. Merge into the existing cache
+				// entry so a Mode 1 tick doesn't blow away OHLC populated by
+				// the last Mode 2 quote.
 				if (!symbol.IsEmpty() && !exchange.IsEmpty())
 				{
+					CString ticker = symbol + _T("-") + exchange;
 					QuoteCache quote;
+					g_QuoteCache.Lookup(ticker, quote);   // start from cached, if any
+
 					quote.symbol = symbol;
 					quote.exchange = exchange;
-					quote.ltp = ltp;
-					quote.open = open;
-					quote.high = high;
-					quote.low = low;
-					quote.close = close;
-					quote.volume = volume;
-					quote.oi = oi;
+					if (ltp    > 0.0f) quote.ltp    = ltp;
+					if (open   > 0.0f) quote.open   = open;
+					if (high   > 0.0f) quote.high   = high;
+					if (low    > 0.0f) quote.low    = low;
+					if (close  > 0.0f) quote.close  = close;
+					if (volume > 0.0f) quote.volume = volume;
+					if (oi     > 0.0f) quote.oi     = oi;
 					quote.lastUpdate = (DWORD)GetTickCount64();
 
-					CString ticker = symbol + _T("-") + exchange;
 					g_QuoteCache.SetAt(ticker, quote);
 
 					// Process tick for real-time candle building
@@ -3212,22 +3293,36 @@ BOOL ProcessWebSocketData(void)
 			OutputDebugString(_T("OpenAlgo: Server closed after ~1 minute - will attempt auto-reconnect"));
 			OutputDebugString(_T("OpenAlgo: ========================================================"));
 
-			// Mark as disconnected
+			// Mark as disconnected. IMPORTANT: do NOT clear g_SubscribedSymbols
+			// here -- we need that list to re-issue subscribes after reconnect.
 			g_bWebSocketConnected = FALSE;
 			g_bWebSocketAuthenticated = FALSE;
 			closesocket(g_websocket);
 			g_websocket = INVALID_SOCKET;
-
-			// Clear subscriptions so they'll be re-subscribed on reconnect
-			EnterCriticalSection(&g_WebSocketCriticalSection);
-			g_SubscribedSymbols.RemoveAll();
-			LeaveCriticalSection(&g_WebSocketCriticalSection);
 
 			// Attempt immediate reconnection
 			OutputDebugString(_T("OpenAlgo: Attempting WebSocket reconnection..."));
 			if (InitializeWebSocket())
 			{
 				OutputDebugString(_T("OpenAlgo: *** RECONNECTED SUCCESSFULLY! ***"));
+
+				// Re-send subscribe for every symbol we were tracking.
+				EnterCriticalSection(&g_WebSocketCriticalSection);
+				int reSubbed = 0;
+				POSITION rpos = g_SubscribedSymbols.GetStartPosition();
+				while (rpos != NULL)
+				{
+					CString sym;
+					BOOL b;
+					g_SubscribedSymbols.GetNextAssoc(rpos, sym, b);
+					SubscribeToSymbol(sym);
+					reSubbed++;
+				}
+				LeaveCriticalSection(&g_WebSocketCriticalSection);
+
+				CString resubLog;
+				resubLog.Format(_T("OpenAlgo: Re-subscribed %d symbol(s) after immediate reconnect"), reSubbed);
+				OutputDebugString(resubLog);
 			}
 			else
 			{
