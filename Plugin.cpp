@@ -194,6 +194,12 @@ static HANDLE g_hHttpWorkEvent = NULL;          // auto-reset, signaled on enque
 static CWinThread* g_pHttpWorkerThread = NULL;
 static volatile LONG g_bHttpWorkerShouldStop = 0;
 
+// Dedicated WS reader thread: blocks in select() so a tick is drained the
+// instant it arrives, instead of relying on a UI WM_TIMER that gets coalesced
+// for seconds when AmiBroker is busy painting.
+static CWinThread* g_pWsReaderThread = NULL;
+static volatile LONG g_bWsReaderShouldStop = 0;
+
 // Cache freshness windows. Stale entries trigger a background refresh but the
 // stale data is still served immediately so the chart never goes blank.
 static const DWORD ONEMIN_CACHE_LIFETIME_MS = 60000;     // refresh 1m every 60s
@@ -207,6 +213,9 @@ UINT __cdecl HttpWorkerThreadProc(LPVOID pArg);
 void StartHttpWorker(void);
 void StopHttpWorker(void);
 void CleanupSymbolBarCache(void);
+UINT __cdecl WsReaderThreadProc(LPVOID pArg);
+void StartWsReader(void);
+void StopWsReader(void);
 void SetupRetry(void);
 BOOL TestOpenAlgoConnection(void);
 BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote);
@@ -1263,6 +1272,11 @@ PLUGINAPI int Init(void)
 
 		StartHttpWorker();
 
+		// Launch the WS reader thread before (or alongside) the initial
+		// InitializeWebSocket() so reconnect attempts also run off the UI
+		// thread. The thread is the only caller of recv() on g_websocket.
+		StartWsReader();
+
 		// Log real-time settings
 		CString rtMsg;
 		rtMsg.Format(_T("OpenAlgo: Real-Time Candles Enabled = %d, Backfill Interval = %d ms"),
@@ -1288,6 +1302,10 @@ PLUGINAPI int Init(void)
 PLUGINAPI int Release(void)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
+
+	// Stop the WS reader thread FIRST so it isn't sitting in select() on a
+	// socket we're about to close from CleanupWebSocket().
+	StopWsReader();
 
 	// Fix #3: stop worker before touching shared state it might still be reading
 	StopHttpWorker();
@@ -1628,18 +1646,11 @@ VOID CALLBACK OnTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
-	// High-frequency WebSocket data processing timer (every 100ms)
-	if (idEvent == TIMER_WEBSOCKET)
-	{
-		// ALWAYS call ProcessWebSocketData() if real-time candles are enabled
-		// ProcessWebSocketData() has its own auto-reconnect logic when disconnected
-		// DO NOT check g_bWebSocketConnected here, or auto-reconnect will never run!
-		if (g_bRealTimeCandlesEnabled)
-		{
-			ProcessWebSocketData();
-		}
-		return;
-	}
+	// TIMER_WEBSOCKET was previously fired from the AmiBroker UI thread every
+	// 100 ms to drain the WS socket. WM_TIMER messages are coalesced when the
+	// UI is busy (chart paint, indicator recompute), so ticks were arriving
+	// 2-7 s late. The WS read now runs on a dedicated WsReaderThread that
+	// blocks in select() and never depends on the UI message pump.
 
 	if (idEvent == TIMER_INIT || idEvent == TIMER_REFRESH)
 	{
@@ -1699,13 +1710,8 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 		{
 			SetTimer(g_hAmiBrokerWnd, TIMER_INIT, 1000, (TIMERPROC)OnTimerProc);
 
-			// Start high-frequency WebSocket timer (100ms) for continuous tick processing
-			// This ensures we read WebSocket data continuously, not just when GetQuotesEx() is called
-			if (g_bRealTimeCandlesEnabled)
-			{
-				SetTimer(g_hAmiBrokerWnd, TIMER_WEBSOCKET, 100, (TIMERPROC)OnTimerProc);
-				OutputDebugString(_T("OpenAlgo: Started TIMER_WEBSOCKET (100ms) for continuous tick processing"));
-			}
+			// WS draining now runs on the dedicated WsReaderThread (started in
+			// Init via StartWsReader), so we no longer schedule TIMER_WEBSOCKET.
 
 			// Force immediate status update
 			::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
@@ -1719,7 +1725,7 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 		{
 			KillTimer(g_hAmiBrokerWnd, TIMER_INIT);
 			KillTimer(g_hAmiBrokerWnd, TIMER_REFRESH);
-			KillTimer(g_hAmiBrokerWnd, TIMER_WEBSOCKET);
+			// (TIMER_WEBSOCKET no longer created; nothing to kill)
 		}
 		g_hAmiBrokerWnd = NULL;
 		g_nStatus = STATUS_SHUTDOWN;
@@ -2153,8 +2159,10 @@ PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 	
 	LeaveCriticalSection(&g_WebSocketCriticalSection);
 
-	// Process any pending WebSocket data
-	ProcessWebSocketData();
+	// Do NOT call ProcessWebSocketData() here. The dedicated WsReaderThread is
+	// the only socket reader; if GetRecentInfo also called recv() concurrently
+	// from the UI thread, two readers could split a frame between them and
+	// corrupt the parser. The thread's drain populates g_QuoteCache for us.
 
 	// Check cache for WebSocket data first
 	QuoteCache cachedQuote;
@@ -3720,4 +3728,102 @@ void CleanupSymbolBarCache(void)
 	}
 	g_SymbolBarCache.RemoveAll();
 	LeaveCriticalSection(&g_SymbolBarCacheCS);
+}
+
+//////////////////////////////////////////////////////////
+// Dedicated WS reader thread
+//
+// Replaces the old TIMER_WEBSOCKET (100 ms UI-thread polling) which suffered
+// from WM_TIMER coalescing whenever AmiBroker's UI was busy. The thread
+// blocks in select() with a 1 s timeout, so a tick is drained the instant
+// it arrives and the chart sees it within one PostMessage hop.
+//
+// Threading contract:
+//   - This thread is the SOLE caller of recv() on g_websocket.
+//   - The UI thread may call send() (SubscribeToSymbol/UnsubscribeFromSymbol);
+//     Winsock allows concurrent send+recv on the same socket from different
+//     threads. Socket lifecycle (close/recreate) is owned by this thread.
+//   - g_bWebSocketConnected is set FALSE before closesocket() so a stale UI
+//     send() at most gets an error return, never a use-after-free.
+//////////////////////////////////////////////////////////
+
+UINT __cdecl WsReaderThreadProc(LPVOID /*pArg*/)
+{
+	AFX_MANAGE_STATE(AfxGetStaticModuleState());
+	OutputDebugString(_T("OpenAlgo: WsReaderThread started"));
+
+	while (InterlockedCompareExchange(&g_bWsReaderShouldStop, 0, 0) == 0)
+	{
+		// Real-time disabled in settings: idle until re-enabled
+		if (!g_bRealTimeCandlesEnabled)
+		{
+			Sleep(500);
+			continue;
+		}
+
+		if (g_bWebSocketConnected && g_websocket != INVALID_SOCKET)
+		{
+			// Block up to 1 s waiting for inbound data. Worst-case latency
+			// from tick on the wire to ProcessTick is one select() wake-up
+			// plus the drain loop inside ProcessWebSocketData -- a few ms.
+			fd_set readfds;
+			FD_ZERO(&readfds);
+			FD_SET(g_websocket, &readfds);
+			struct timeval tv;
+			tv.tv_sec = 1;
+			tv.tv_usec = 0;
+			select(0, &readfds, NULL, NULL, &tv);
+
+			// Whether select returned >0 (data), 0 (timeout) or <0 (error),
+			// let ProcessWebSocketData figure it out. It already handles
+			// "no data", "graceful close", and "ping due" internally.
+			ProcessWebSocketData();
+		}
+		else
+		{
+			// Not connected: ProcessWebSocketData has a rate-limited
+			// (5 s) reconnect attempt. Call it then back off so we don't
+			// CPU-spin while the server is unreachable.
+			ProcessWebSocketData();
+			Sleep(500);
+		}
+	}
+
+	OutputDebugString(_T("OpenAlgo: WsReaderThread exiting"));
+	return 0;
+}
+
+void StartWsReader(void)
+{
+	if (g_pWsReaderThread != NULL)
+		return;
+
+	InterlockedExchange(&g_bWsReaderShouldStop, 0);
+
+	g_pWsReaderThread = AfxBeginThread(WsReaderThreadProc, NULL,
+	                                   THREAD_PRIORITY_NORMAL, 0,
+	                                   CREATE_SUSPENDED);
+	if (g_pWsReaderThread)
+	{
+		g_pWsReaderThread->m_bAutoDelete = FALSE;
+		g_pWsReaderThread->ResumeThread();
+		OutputDebugString(_T("OpenAlgo: WsReader thread launched"));
+	}
+	else
+	{
+		OutputDebugString(_T("OpenAlgo: StartWsReader - AfxBeginThread failed"));
+	}
+}
+
+void StopWsReader(void)
+{
+	if (g_pWsReaderThread == NULL)
+		return;
+
+	InterlockedExchange(&g_bWsReaderShouldStop, 1);
+
+	// Wait up to 2 s for the loop to exit on its next select() timeout.
+	WaitForSingleObject(g_pWsReaderThread->m_hThread, 2000);
+	delete g_pWsReaderThread;
+	g_pWsReaderThread = NULL;
 }
