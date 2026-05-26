@@ -49,6 +49,7 @@ protected:
 	virtual void OnOK();
 	afx_msg void OnTestConnectionButton();
 	afx_msg void OnTestWebSocketButton();
+	afx_msg void OnApiKeyEditSetFocus();
 	//}}AFX_MSG
 	DECLARE_MESSAGE_MAP()
 

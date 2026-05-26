@@ -58,38 +58,59 @@ BEGIN_MESSAGE_MAP(COpenAlgoConfigDlg, CDialog)
 	//{{AFX_MSG_MAP(COpenAlgoConfigDlg)
 	ON_BN_CLICKED(IDC_TEST_CONNECTION_BUTTON, OnTestConnectionButton)
 	ON_BN_CLICKED(IDC_TEST_WEBSOCKET_BUTTON, OnTestWebSocketButton)
+	ON_EN_SETFOCUS(IDC_APIKEY_EDIT, OnApiKeyEditSetFocus)
 	//}}AFX_MSG_MAP
 END_MESSAGE_MAP()
+
+// Log helper: never spell out the full API key. Keep the first/last few chars
+// only so the user can tell from DbgView which key got saved without leaking it.
+static CString MaskKey(const CString& key)
+{
+	CString s;
+	int n = key.GetLength();
+	if (n <= 8) { s.Format(_T("(len=%d)"), n); return s; }
+	s.Format(_T("%s...%s (len=%d)"), (LPCTSTR)key.Left(4), (LPCTSTR)key.Right(4), n);
+	return s;
+}
 
 /////////////////////////////////////////////////////////////////////////////
 // COpenAlgoConfigDlg message handlers
 
 BOOL COpenAlgoConfigDlg::OnInitDialog()
 {
+	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 	CDialog::OnInitDialog();
 
-	// Set dialog title
 	SetWindowText(_T("OpenAlgo Plugin Configuration"));
 
-	// Set focus to server edit control
+	// Diagnostic so we can verify in DbgView which key the dialog opened with.
+	CString log;
+	log.Format(_T("OpenAlgo: Config dialog opened. Existing ApiKey=%s"), (LPCTSTR)MaskKey(g_oApiKey));
+	OutputDebugString(log);
+
 	CWnd* pServerEdit = GetDlgItem(IDC_SERVER_EDIT);
 	if (pServerEdit)
-	{
 		pServerEdit->SetFocus();
-	}
 
-	return FALSE;  // We set the focus manually
+	return FALSE;
+}
+
+// Auto-select all text in the API Key field whenever it receives focus so
+// users replace the existing masked key by typing rather than appending to it.
+void COpenAlgoConfigDlg::OnApiKeyEditSetFocus()
+{
+	CEdit* pEdit = (CEdit*)GetDlgItem(IDC_APIKEY_EDIT);
+	if (pEdit)
+		pEdit->SetSel(0, -1);
 }
 
 void COpenAlgoConfigDlg::OnOK()
 {
-	// Update data from controls
-	if (!UpdateData(TRUE))
-	{
-		return; // Validation failed
-	}
+	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
-	// Validate server address
+	if (!UpdateData(TRUE))
+		return;
+
 	if (g_oServer.IsEmpty())
 	{
 		AfxMessageBox(_T("Please enter a server address."), MB_OK | MB_ICONWARNING);
@@ -97,7 +118,6 @@ void COpenAlgoConfigDlg::OnOK()
 		return;
 	}
 
-	// Validate API Key
 	if (g_oApiKey.IsEmpty())
 	{
 		AfxMessageBox(_T("Please enter your OpenAlgo API Key."), MB_OK | MB_ICONWARNING);
@@ -105,17 +125,39 @@ void COpenAlgoConfigDlg::OnOK()
 		return;
 	}
 
-	// Save settings to registry under "OpenAlgo" key
-	AfxGetApp()->WriteProfileString(_T("OpenAlgo"), _T("Server"), g_oServer);
-	AfxGetApp()->WriteProfileString(_T("OpenAlgo"), _T("ApiKey"), g_oApiKey);
-	AfxGetApp()->WriteProfileString(_T("OpenAlgo"), _T("WebSocketUrl"), g_oWebSocketUrl);
-	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("Port"), g_nPortNumber);
-	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), g_nRefreshInterval);
-	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("TimeShift"), g_nTimeShift);
+	// Defensive: ensure m_pszRegistryKey is set. CWinApp::InitInstance is not
+	// reliably called for Regular MFC DLLs, so SetRegistryKey from our
+	// COpenAlgoApp::InitInstance may never run. Calling it here is idempotent
+	// and guarantees WriteProfileString hits the registry instead of falling
+	// back to WIN.INI (where the write would silently fail).
+	theApp.EnsureRegistryRoot();
+	CWinApp* pApp = AfxGetApp();
 
-	// Save real-time candles settings (declared in OpenAlgoGlobals.h)
-	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("EnableRealTimeCandles"), g_bRealTimeCandlesEnabled ? 1 : 0);
-	AfxGetApp()->WriteProfileInt(_T("OpenAlgo"), _T("BackfillIntervalMs"), g_nBackfillIntervalMs);
+	BOOL bSrv  = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("Server"),        g_oServer)        : FALSE;
+	BOOL bKey  = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("ApiKey"),        g_oApiKey)        : FALSE;
+	BOOL bWs   = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("WebSocketUrl"),  g_oWebSocketUrl)  : FALSE;
+	BOOL bPort = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("Port"),          g_nPortNumber)    : FALSE;
+	BOOL bIv   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("RefreshInterval"), g_nRefreshInterval) : FALSE;
+	BOOL bTs   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("TimeShift"),     g_nTimeShift)     : FALSE;
+	BOOL bRt   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("EnableRealTimeCandles"), g_bRealTimeCandlesEnabled ? 1 : 0) : FALSE;
+	BOOL bBf   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("BackfillIntervalMs"),    g_nBackfillIntervalMs)            : FALSE;
+
+	CString log;
+	log.Format(
+		_T("OpenAlgo: OnOK saved ApiKey=%s Server=%s "
+		   "(srv=%d key=%d ws=%d port=%d iv=%d ts=%d rt=%d bf=%d)"),
+		(LPCTSTR)MaskKey(g_oApiKey), (LPCTSTR)g_oServer,
+		bSrv, bKey, bWs, bPort, bIv, bTs, bRt, bBf);
+	OutputDebugString(log);
+
+	if (!bKey)
+	{
+		AfxMessageBox(
+			_T("Failed to write the OpenAlgo API key to the registry.\n")
+			_T("Check that AmiBroker has write access to HKCU\\Software\\OpenAlgo."),
+			MB_OK | MB_ICONERROR);
+		return;
+	}
 
 	CDialog::OnOK();
 }

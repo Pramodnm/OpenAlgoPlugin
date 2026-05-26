@@ -24,6 +24,11 @@ class COpenAlgoApp : public CWinApp
 public:
 	COpenAlgoApp();
 
+	// Public wrapper around the protected CWinApp::SetRegistryKey so non-member
+	// callers (Init/Notify/OnOK) can force m_pszRegistryKey to be set even when
+	// MFC didn't run InitInstance (Regular MFC DLLs often skip it).
+	void EnsureRegistryRoot(LPCTSTR pszKey = _T("OpenAlgo")) { SetRegistryKey(pszKey); }
+
 	// Overrides
 	// ClassWizard generated virtual function overrides
 	//{{AFX_VIRTUAL(COpenAlgoApp)
