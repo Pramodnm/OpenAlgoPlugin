@@ -263,6 +263,55 @@ int CompareQuotations(const void* a, const void* b);
 // Helper Functions
 ///////////////////////////////
 
+// Extract top-of-book from a Mode 3 (Depth) WS frame. sideKey is "buy"
+// or "sell"; we want the first {price, quantity} inside that array.
+// String-based parsing is tolerant of whitespace, but assumes the array
+// elements look like {"price":N,"quantity":M,...}.
+static BOOL ExtractFirstDepthLevel(const CString& json, LPCTSTR sideKey,
+                                   float& outPrice, float& outQty)
+{
+	outPrice = 0.0f;
+	outQty   = 0.0f;
+
+	CString needle;
+	needle.Format(_T("\"%s\":["), sideKey);
+	int pos = json.Find(needle);
+	if (pos < 0) return FALSE;
+	pos += needle.GetLength();
+
+	// Advance to the first '{' inside the array (skip whitespace)
+	while (pos < json.GetLength() &&
+	       json[pos] != _T('{') && json[pos] != _T(']'))
+		pos++;
+	if (pos >= json.GetLength() || json[pos] != _T('{')) return FALSE;
+
+	int objEnd = json.Find(_T('}'), pos);
+	if (objEnd <= pos) return FALSE;
+	CString obj = json.Mid(pos, objEnd - pos + 1);
+
+	int pp = obj.Find(_T("\"price\":"));
+	if (pp >= 0)
+	{
+		pp += 8;
+		int e = obj.Find(_T(','), pp);
+		if (e < 0) e = obj.Find(_T('}'), pp);
+		if (e < 0) e = obj.GetLength();
+		outPrice = (float)_tstof(obj.Mid(pp, e - pp));
+	}
+
+	int qp = obj.Find(_T("\"quantity\":"));
+	if (qp >= 0)
+	{
+		qp += 11;
+		int e = obj.Find(_T(','), qp);
+		if (e < 0) e = obj.Find(_T('}'), qp);
+		if (e < 0) e = obj.GetLength();
+		outQty = (float)_tstof(obj.Mid(qp, e - qp));
+	}
+
+	return (outPrice > 0.0f);
+}
+
 // Compare two quotations for sorting by timestamp (oldest to newest)
 // Used by qsort() to ensure quotes array is in chronological order
 // This is CRITICAL for AmiBroker to display charts correctly
@@ -3031,27 +3080,30 @@ BOOL SubscribeToSymbol(LPCTSTR pszTicker)
 		symbol, exchange);
 	OutputDebugString(extractLog);
 
-	// Send TWO subscriptions per symbol in the flat/legacy server format:
-	//   Mode 1 (LTP)   = every-tick price - feeds the chart's live current bar
-	//   Mode 2 (Quote) = OHLC + volume on significant changes - feeds the
-	//                    Realtime Quote Window (Last/Open/High/Low/Volume)
-	// Without both, either the chart lags (no LTP ticks) or the quote window
-	// shows zeros for everything except Last.
-	CString subLtp, subQuote;
+	// Send TWO subscriptions per symbol:
+	//   Mode 1 (LTP)   = every-tick price -- feeds the chart's live current bar
+	//   Mode 3 (Depth) = full snapshot (OHLC + volume + ltp) PLUS the 5-level
+	//                    DOM. We use depth.buy[0]/sell[0] as top-of-book bid/ask
+	//                    for the Realtime Quote Window and as the source of
+	//                    Time & Sales events (RI_STATUS_NEW_BID/NEW_ASK/TRADE).
+	// Mode 2 (Quote) was previously here, but Mode 3 is a strict superset of
+	// Mode 2 for our needs and additionally carries the DOM. Probe confirmed
+	// dhan emits Mode 3 frames with full OHLC + depth.
+	CString subLtp, subDepth;
 	subLtp.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
-	subQuote.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":2}"),
+	subDepth.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":3}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
 
 	BOOL r1 = SendWebSocketFrame(subLtp);
-	BOOL r2 = SendWebSocketFrame(subQuote);
+	BOOL r3 = SendWebSocketFrame(subDepth);
 
 	CString resultLog;
-	resultLog.Format(_T("OpenAlgo: SubscribeToSymbol %s -- ltp_send=%d quote_send=%d"),
-		(LPCTSTR)pszTicker, r1, r2);
+	resultLog.Format(_T("OpenAlgo: SubscribeToSymbol %s -- ltp_send=%d depth_send=%d"),
+		(LPCTSTR)pszTicker, r1, r3);
 	OutputDebugString(resultLog);
 
-	BOOL result = (r1 || r2);
+	BOOL result = (r1 || r3);
 
 	return result;
 }
@@ -3065,15 +3117,15 @@ BOOL UnsubscribeFromSymbol(LPCTSTR pszTicker)
 	CString symbol = GetCleanSymbol(pszTicker);
 	CString exchange = GetExchangeFromTicker(pszTicker);
 	
-	// Mirror SubscribeToSymbol's dual subscribe: unsubscribe both modes
-	CString unsubLtp, unsubQuote;
+	// Mirror SubscribeToSymbol's dual subscribe: unsubscribe LTP and Depth
+	CString unsubLtp, unsubDepth;
 	unsubLtp.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
-	unsubQuote.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":2}"),
+	unsubDepth.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":3}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
 	BOOL r1 = SendWebSocketFrame(unsubLtp);
-	BOOL r2 = SendWebSocketFrame(unsubQuote);
-	return (r1 || r2);
+	BOOL r3 = SendWebSocketFrame(unsubDepth);
+	return (r1 || r3);
 }
 
 void SubscribePendingSymbols(void)
@@ -3324,6 +3376,7 @@ BOOL ProcessWebSocketData(void)
 				CString symbol, exchange, timestamp;
 				float ltp = 0, open = 0, high = 0, low = 0, close = 0, volume = 0, oi = 0;
 				float lastTradeQty = 0;  // NEW: For real-time candle building
+				float bidPx = 0, bidQty = 0, askPx = 0, askQty = 0;  // Mode 3 DOM L1
 
 				// Extract symbol (handle JSON with or without spaces after colon)
 				int symbolPos = data.Find(_T("\"symbol\":"));
@@ -3417,6 +3470,13 @@ BOOL ProcessWebSocketData(void)
 					}
 				}
 
+				// Mode 3 (Depth) only: extract top-of-book bid/ask. These
+				// remain 0 for Mode 1 (LTP-only) frames which is fine -- we
+				// preserve the previously cached bid/ask in the RecentInfo
+				// update path below.
+				ExtractFirstDepthLevel(data, _T("buy"),  bidPx, bidQty);
+				ExtractFirstDepthLevel(data, _T("sell"), askPx, askQty);
+
 				// Extract last trade quantity - try both field names
 				// Legacy format: "last_trade_quantity":100
 				// Docs format: "ltq":100
@@ -3508,14 +3568,18 @@ BOOL ProcessWebSocketData(void)
 					g_QuoteCache.SetAt(ticker, quote);
 
 					// Update the persistent RecentInfo for the Realtime Quote
-					// Window + Time & Sales (replaces old static-struct path).
+					// Window + Time & Sales (Mode 1 LTP + Mode 3 Depth path).
 					struct RecentInfo* pRI = GetOrCreateRecentInfoEntry(ticker);
 					if (pRI)
 					{
 						EnterCriticalSection(&g_RecentInfoCS);
-						pRI->nStatus = RI_STATUS_UPDATE | RI_STATUS_TRADE | RI_STATUS_BARSREADY;
-						// nBitmap accumulates over Mode 1 + Mode 2 frames so each
-						// field stays "valid" once we've ever seen it for the symbol.
+
+						// Snapshot previous values so we can detect transitions
+						// (TRADE / NEW_BID / NEW_ASK) below and drive Time & Sales.
+						float prevLast = pRI->fLast;
+						float prevBid  = pRI->fBid;
+						float prevAsk  = pRI->fAsk;
+
 						int bm = pRI->nBitmap;
 						if (ltp    > 0.0f) { pRI->fLast = ltp;       bm |= RI_LAST; }
 						if (open   > 0.0f) { pRI->fOpen = open;      bm |= RI_OPEN; }
@@ -3529,8 +3593,8 @@ BOOL ProcessWebSocketData(void)
 						}
 						if (volume > 0.0f)
 						{
-							pRI->iTotalVol = (int)volume;   // legacy 32-bit
-							pRI->fTotalVol = volume;        // 5.27+ float
+							pRI->iTotalVol = (int)volume;
+							pRI->fTotalVol = volume;
 							bm |= RI_TOTALVOL;
 						}
 						if (lastTradeQty > 0.0f)
@@ -3540,22 +3604,36 @@ BOOL ProcessWebSocketData(void)
 							bm |= RI_TRADEVOL;
 						}
 						if (oi     > 0.0f) { pRI->fOpenInt = oi;     bm |= RI_OPENINT; }
+
+						// Top-of-book from Mode 3 Depth frames
+						if (bidPx  > 0.0f) { pRI->fBid     = bidPx;  pRI->iBidSize = (int)bidQty; bm |= RI_BID; }
+						if (askPx  > 0.0f) { pRI->fAsk     = askPx;  pRI->iAskSize = (int)askQty; bm |= RI_ASK; }
 						pRI->nBitmap = bm;
+
+						// nStatus drives Time & Sales row type. We compute the
+						// flags AFTER the field writes so we know exactly which
+						// values changed in THIS frame.
+						int newStatus = RI_STATUS_UPDATE | RI_STATUS_BARSREADY;
+						BOOL fireTrade  = (ltp   > 0.0f && ltp   != prevLast);
+						BOOL fireNewBid = (bidPx > 0.0f && bidPx != prevBid);
+						BOOL fireNewAsk = (askPx > 0.0f && askPx != prevAsk);
+						if (fireTrade)  newStatus |= RI_STATUS_TRADE;
+						if (fireNewBid) newStatus |= RI_STATUS_NEW_BID | RI_STATUS_BIDASK;
+						if (fireNewAsk) newStatus |= RI_STATUS_NEW_ASK | RI_STATUS_BIDASK;
+						pRI->nStatus = newStatus;
 
 						// nDateUpdate / nTimeUpdate MUST be refreshed every tick
 						// or AmiBroker's Quote Window won't update.
 						CTime nowT = CTime::GetCurrentTime();
 						pRI->nDateUpdate = nowT.GetYear() * 10000 + nowT.GetMonth() * 100 + nowT.GetDay();
 						pRI->nTimeUpdate = nowT.GetHour() * 10000 + nowT.GetMinute() * 100 + nowT.GetSecond();
-						pRI->nDateChange = pRI->nDateUpdate;
-						pRI->nTimeChange = pRI->nTimeUpdate;
+						if (fireTrade) { pRI->nDateChange = pRI->nDateUpdate; pRI->nTimeChange = pRI->nTimeUpdate; }
 						LeaveCriticalSection(&g_RecentInfoCS);
 
-						// Post WM_USER_STREAMING_UPDATE with LPARAM = pRecentInfo
-						// so AmiBroker records the trade in Time & Sales. Pointer
-						// is owned by the persistent map -- safe across the async
-						// message hop.
-						if (g_hAmiBrokerWnd != NULL && ltp > 0.0f)
+						// Always post when SOMETHING transitioned, so AmiBroker
+						// gets a fresh read AND so Time & Sales records the
+						// trade/bid/ask event with the right row type.
+						if (g_hAmiBrokerWnd != NULL && (fireTrade || fireNewBid || fireNewAsk))
 						{
 							PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE,
 							            0, (LPARAM)pRI);
