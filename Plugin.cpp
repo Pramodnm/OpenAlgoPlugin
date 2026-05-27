@@ -238,7 +238,6 @@ void StartWsReader(void);
 void StopWsReader(void);
 void SetupRetry(void);
 BOOL TestOpenAlgoConnection(void);
-BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote);
 int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int nSize, struct Quotation* pQuotes);
 CString GetExchangeFromTicker(LPCTSTR pszTicker);
 CString GetIntervalString(int nPeriodicity);
@@ -273,21 +272,111 @@ int CompareQuotations(const void* a, const void* b);
 // Helper Functions
 ///////////////////////////////
 
+static BOOL IsJsonWhitespace(TCHAR ch)
+{
+	return ch == _T(' ') || ch == _T('\t') || ch == _T('\r') || ch == _T('\n');
+}
+
+// Finds the first character of a JSON value after "key":, allowing the
+// default spaces emitted by Python/json.dumps.
+static int FindJsonValueStart(const CString& json, LPCTSTR key, int startPos = 0)
+{
+	CString needle;
+	needle.Format(_T("\"%s\""), key);
+
+	int keyPos = json.Find(needle, startPos);
+	while (keyPos >= 0)
+	{
+		int pos = keyPos + needle.GetLength();
+		while (pos < json.GetLength() && IsJsonWhitespace(json[pos]))
+			pos++;
+
+		if (pos < json.GetLength() && json[pos] == _T(':'))
+		{
+			pos++;
+			while (pos < json.GetLength() && IsJsonWhitespace(json[pos]))
+				pos++;
+			return pos;
+		}
+
+		keyPos = json.Find(needle, keyPos + needle.GetLength());
+	}
+
+	return -1;
+}
+
+static CString ExtractJsonStringValue(const CString& json, LPCTSTR key)
+{
+	CString value;
+	int pos = FindJsonValueStart(json, key);
+	if (pos < 0 || pos >= json.GetLength() || json[pos] != _T('"'))
+		return value;
+
+	pos++;
+	int endPos = json.Find(_T("\""), pos);
+	if (endPos > pos)
+		value = json.Mid(pos, endPos - pos);
+
+	return value;
+}
+
+static float ExtractJsonFloatValue(const CString& json, LPCTSTR key)
+{
+	int pos = FindJsonValueStart(json, key);
+	if (pos < 0)
+		return 0.0f;
+
+	int endPos = pos;
+	while (endPos < json.GetLength() &&
+	       json[endPos] != _T(',') &&
+	       json[endPos] != _T('}') &&
+	       json[endPos] != _T(']'))
+	{
+		endPos++;
+	}
+
+	CString val = json.Mid(pos, endPos - pos);
+	val.Trim();
+	return (float)_tstof(val);
+}
+
+static int ExtractJsonIntValue(const CString& json, LPCTSTR key)
+{
+	int pos = FindJsonValueStart(json, key);
+	if (pos < 0)
+		return 0;
+
+	int endPos = pos;
+	while (endPos < json.GetLength() &&
+	       json[endPos] != _T(',') &&
+	       json[endPos] != _T('}') &&
+	       json[endPos] != _T(']'))
+	{
+		endPos++;
+	}
+
+	CString val = json.Mid(pos, endPos - pos);
+	val.Trim();
+	return _ttoi(val);
+}
+
 // Extract top-of-book from a Mode 3 (Depth) WS frame. sideKey is "buy"
-// or "sell"; we want the first {price, quantity} inside that array.
-// String-based parsing is tolerant of whitespace, but assumes the array
-// elements look like {"price":N,"quantity":M,...}.
+// or "sell" for protocol.md frames, and "bids" or "asks" for the REST-style
+// websocket docs. We want the first {price, quantity} inside that array.
 static BOOL ExtractFirstDepthLevel(const CString& json, LPCTSTR sideKey,
                                    float& outPrice, float& outQty)
 {
 	outPrice = 0.0f;
 	outQty   = 0.0f;
 
-	CString needle;
-	needle.Format(_T("\"%s\":["), sideKey);
-	int pos = json.Find(needle);
+	int pos = FindJsonValueStart(json, sideKey);
 	if (pos < 0) return FALSE;
-	pos += needle.GetLength();
+
+	while (pos < json.GetLength() && IsJsonWhitespace(json[pos]))
+		pos++;
+	if (pos >= json.GetLength() || json[pos] != _T('['))
+		return FALSE;
+	pos++;
 
 	// Advance to the first '{' inside the array (skip whitespace)
 	while (pos < json.GetLength() &&
@@ -650,186 +739,6 @@ void ConvertUnixToPackedDate(time_t unixTime, union AmiDate* pAmiDate)
 	pAmiDate->PackDate.MicroSec = 0;
 	pAmiDate->PackDate.Reserved = 0;
 	pAmiDate->PackDate.IsFuturePad = 0;
-}
-
-// Fetch real-time quote from OpenAlgo
-// WARNING: This is ONLY for Level 1 quotes in Real-time Quote Window
-// NEVER use this data for creating OHLC bars or historical charts
-BOOL GetOpenAlgoQuote(LPCTSTR pszTicker, QuoteCache& quote)
-{
-	AFX_MANAGE_STATE(AfxGetStaticModuleState());
-
-	if (g_oApiKey.IsEmpty())
-		return FALSE;
-
-	BOOL bSuccess = FALSE;
-
-	try
-	{
-		CString oURL = BuildOpenAlgoURL(g_oServer, g_nPortNumber, _T("/api/v1/quotes"));
-
-		// Prepare POST data
-		CString symbol = GetCleanSymbol(pszTicker);
-		CString exchange = GetExchangeFromTicker(pszTicker);
-
-		CString oPostData;
-		oPostData.Format(_T("{\"apikey\":\"%s\",\"symbol\":\"%s\",\"exchange\":\"%s\"}"),
-			(LPCTSTR)g_oApiKey, (LPCTSTR)symbol, (LPCTSTR)exchange);
-
-		CInternetSession oSession(AGENT_NAME, 1, INTERNET_OPEN_TYPE_DIRECT, NULL, NULL,
-			INTERNET_FLAG_DONT_CACHE);
-		oSession.SetOption(INTERNET_OPTION_CONNECT_TIMEOUT, 3000);
-		oSession.SetOption(INTERNET_OPTION_RECEIVE_TIMEOUT, 3000);
-
-		CHttpConnection* pConnection = NULL;
-		CHttpFile* pFile = NULL;
-
-		// Parse server
-		INTERNET_PORT nPort = (INTERNET_PORT)g_nPortNumber;
-		CString oServer = g_oServer;
-		oServer.Replace(_T("http://"), _T(""));
-		oServer.Replace(_T("https://"), _T(""));
-
-		pConnection = oSession.GetHttpConnection(oServer, nPort);
-
-		if (pConnection)
-		{
-			pFile = pConnection->OpenRequest(
-				CHttpConnection::HTTP_VERB_POST,
-				_T("/api/v1/quotes"),
-				NULL, 1, NULL, NULL,
-				INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE);
-
-			if (pFile)
-			{
-				CString oHeaders = _T("Content-Type: application/json\r\n");
-				CStringA oPostDataA(oPostData);
-
-				if (pFile->SendRequest(oHeaders, (LPVOID)(LPCSTR)oPostDataA, oPostDataA.GetLength()))
-				{
-					DWORD dwStatusCode = 0;
-					pFile->QueryInfoStatusCode(dwStatusCode);
-
-					if (dwStatusCode == 200)
-					{
-						// Fix #6: Preallocate to keep CString growth from re-allocating
-						// many times when a long JSON body is streamed line-by-line.
-						CString oResponse;
-						oResponse.Preallocate(4096);
-						CString oLine;
-						while (pFile->ReadString(oLine))
-						{
-							oResponse += oLine;
-						}
-
-						// Parse JSON response (simple parsing)
-						if (oResponse.Find(_T("\"status\":\"success\"")) >= 0)
-						{
-							// Extract values using simple string parsing
-							int pos;
-
-							// Parse LTP
-							pos = oResponse.Find(_T("\"ltp\":"));
-							if (pos >= 0)
-							{
-								pos += 6;
-								int endPos = oResponse.Find(_T(","), pos);
-								if (endPos < 0) endPos = oResponse.Find(_T("}"), pos);
-								CString val = oResponse.Mid(pos, endPos - pos);
-								quote.ltp = (float)_tstof(val);
-							}
-
-							// Parse Open
-							pos = oResponse.Find(_T("\"open\":"));
-							if (pos >= 0)
-							{
-								pos += 7;
-								int endPos = oResponse.Find(_T(","), pos);
-								if (endPos < 0) endPos = oResponse.Find(_T("}"), pos);
-								CString val = oResponse.Mid(pos, endPos - pos);
-								quote.open = (float)_tstof(val);
-							}
-
-							// Parse High
-							pos = oResponse.Find(_T("\"high\":"));
-							if (pos >= 0)
-							{
-								pos += 7;
-								int endPos = oResponse.Find(_T(","), pos);
-								if (endPos < 0) endPos = oResponse.Find(_T("}"), pos);
-								CString val = oResponse.Mid(pos, endPos - pos);
-								quote.high = (float)_tstof(val);
-							}
-
-							// Parse Low
-							pos = oResponse.Find(_T("\"low\":"));
-							if (pos >= 0)
-							{
-								pos += 6;
-								int endPos = oResponse.Find(_T(","), pos);
-								if (endPos < 0) endPos = oResponse.Find(_T("}"), pos);
-								CString val = oResponse.Mid(pos, endPos - pos);
-								quote.low = (float)_tstof(val);
-							}
-
-							// Parse Volume
-							pos = oResponse.Find(_T("\"volume\":"));
-							if (pos >= 0)
-							{
-								pos += 9;
-								int endPos = oResponse.Find(_T(","), pos);
-								if (endPos < 0) endPos = oResponse.Find(_T("}"), pos);
-								CString val = oResponse.Mid(pos, endPos - pos);
-								quote.volume = (float)_tstof(val);
-							}
-
-							// Parse OI
-							pos = oResponse.Find(_T("\"oi\":"));
-							if (pos >= 0)
-							{
-								pos += 5;
-								int endPos = oResponse.Find(_T(","), pos);
-								if (endPos < 0) endPos = oResponse.Find(_T("}"), pos);
-								CString val = oResponse.Mid(pos, endPos - pos);
-								quote.oi = (float)_tstof(val);
-							}
-
-							// Parse Previous Close
-							pos = oResponse.Find(_T("\"prev_close\":"));
-							if (pos >= 0)
-							{
-								pos += 13;
-								int endPos = oResponse.Find(_T(","), pos);
-								if (endPos < 0) endPos = oResponse.Find(_T("}"), pos);
-								CString val = oResponse.Mid(pos, endPos - pos);
-								quote.close = (float)_tstof(val);
-							}
-
-							quote.symbol = symbol;
-							quote.exchange = exchange;
-							quote.lastUpdate = (DWORD)GetTickCount64();
-
-							bSuccess = TRUE;
-						}
-					}
-				}
-
-				pFile->Close();
-				delete pFile;
-			}
-
-			pConnection->Close();
-			delete pConnection;
-		}
-
-		oSession.Close();
-	}
-	catch (CInternetException* e)
-	{
-		e->Delete();
-	}
-
-	return bSuccess;
 }
 
 // Fetch historical data from OpenAlgo with intelligent backfill strategy
@@ -2482,7 +2391,7 @@ struct RecentInfo* GetOrCreateRecentInfoEntry(const CString& ticker)
 // GetRecentInfo is ONLY for the Realtime Quote Window + Time & Sales.
 // WS-only -- no HTTP fallback. The broker's /api/v1/quotes endpoint is
 // severely rate-limited and was driving the empty rows for slower symbols.
-// Mode 1 + Mode 2 WS frames now populate a persistent per-symbol RecentInfo
+// Mode 1/2/3 WS frames now populate a persistent per-symbol RecentInfo
 // entry on the worker thread; this function just returns the pointer to it.
 PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 {
@@ -3114,30 +3023,33 @@ BOOL SubscribeToSymbol(LPCTSTR pszTicker)
 		symbol, exchange);
 	OutputDebugString(extractLog);
 
-	// Send TWO subscriptions per symbol:
+	// Send websocket subscriptions per symbol:
 	//   Mode 1 (LTP)   = every-tick price -- feeds the chart's live current bar
+	//   Mode 2 (Quote) = OHLCV / previous close -- feeds Realtime Quote Window
 	//   Mode 3 (Depth) = full snapshot (OHLC + volume + ltp) PLUS the 5-level
 	//                    DOM. We use depth.buy[0]/sell[0] as top-of-book bid/ask
 	//                    for the Realtime Quote Window and as the source of
 	//                    Time & Sales events (RI_STATUS_NEW_BID/NEW_ASK/TRADE).
-	// Mode 2 (Quote) was previously here, but Mode 3 is a strict superset of
-	// Mode 2 for our needs and additionally carries the DOM. Probe confirmed
-	// dhan emits Mode 3 frames with full OHLC + depth.
-	CString subLtp, subDepth;
+	// Keep this websocket-only; do not fall back to /api/v1/quotes for streaming
+	// windows because that endpoint is rate limited and adds avoidable latency.
+	CString subLtp, subQuote, subDepth;
 	subLtp.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
+		(LPCTSTR)symbol, (LPCTSTR)exchange);
+	subQuote.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":2}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
 	subDepth.Format(_T("{\"action\":\"subscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":3}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
 
 	BOOL r1 = SendWebSocketFrame(subLtp);
+	BOOL r2 = SendWebSocketFrame(subQuote);
 	BOOL r3 = SendWebSocketFrame(subDepth);
 
 	CString resultLog;
-	resultLog.Format(_T("OpenAlgo: SubscribeToSymbol %s -- ltp_send=%d depth_send=%d"),
-		(LPCTSTR)pszTicker, r1, r3);
+	resultLog.Format(_T("OpenAlgo: SubscribeToSymbol %s -- ltp_send=%d quote_send=%d depth_send=%d"),
+		(LPCTSTR)pszTicker, r1, r2, r3);
 	OutputDebugString(resultLog);
 
-	BOOL result = (r1 || r3);
+	BOOL result = (r1 || r2 || r3);
 
 	return result;
 }
@@ -3151,15 +3063,18 @@ BOOL UnsubscribeFromSymbol(LPCTSTR pszTicker)
 	CString symbol = GetCleanSymbol(pszTicker);
 	CString exchange = GetExchangeFromTicker(pszTicker);
 	
-	// Mirror SubscribeToSymbol's dual subscribe: unsubscribe LTP and Depth
-	CString unsubLtp, unsubDepth;
+	// Mirror SubscribeToSymbol's websocket subscriptions.
+	CString unsubLtp, unsubQuote, unsubDepth;
 	unsubLtp.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":1}"),
+		(LPCTSTR)symbol, (LPCTSTR)exchange);
+	unsubQuote.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":2}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
 	unsubDepth.Format(_T("{\"action\":\"unsubscribe\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"mode\":3}"),
 		(LPCTSTR)symbol, (LPCTSTR)exchange);
 	BOOL r1 = SendWebSocketFrame(unsubLtp);
+	BOOL r2 = SendWebSocketFrame(unsubQuote);
 	BOOL r3 = SendWebSocketFrame(unsubDepth);
-	return (r1 || r3);
+	return (r1 || r2 || r3);
 }
 
 void SubscribePendingSymbols(void)
@@ -3419,130 +3334,60 @@ BOOL ProcessWebSocketData(void)
 				float ltp = 0, open = 0, high = 0, low = 0, close = 0, volume = 0, oi = 0;
 				float lastTradeQty = 0;  // NEW: For real-time candle building
 				float bidPx = 0, bidQty = 0, askPx = 0, askQty = 0;  // Mode 3 DOM L1
+				CString messageType = ExtractJsonStringValue(data, _T("type"));
+				CString modeText = ExtractJsonStringValue(data, _T("mode"));
+				int wsMode = ExtractJsonIntValue(data, _T("mode"));
+				BOOL bLtpFrame =
+					(wsMode == 1 || messageType.CompareNoCase(_T("ltp")) == 0 ||
+					 modeText.CompareNoCase(_T("ltp")) == 0);
+				BOOL bQuoteFrame =
+					(wsMode == 2 || messageType.CompareNoCase(_T("quote")) == 0 ||
+					 modeText.CompareNoCase(_T("quote")) == 0);
+				BOOL bDepthFrame =
+					(wsMode == 3 || messageType.CompareNoCase(_T("depth")) == 0 ||
+					 modeText.CompareNoCase(_T("depth")) == 0);
 
-				// Extract symbol (handle JSON with or without spaces after colon)
-				int symbolPos = data.Find(_T("\"symbol\":"));
-				if (symbolPos >= 0)
-				{
-					symbolPos += 9;  // Skip "symbol":
-					// Skip optional whitespace
-					while (symbolPos < data.GetLength() && (data[symbolPos] == ' ' || data[symbolPos] == '\t'))
-						symbolPos++;
-					// Skip opening quote
-					if (symbolPos < data.GetLength() && data[symbolPos] == '\"')
-						symbolPos++;
-					int endPos = data.Find(_T("\""), symbolPos);
-					if (endPos > symbolPos)
-						symbol = data.Mid(symbolPos, endPos - symbolPos);
-				}
-
-				// Extract exchange (handle JSON with or without spaces after colon)
-				int exchangePos = data.Find(_T("\"exchange\":"));
-				if (exchangePos >= 0)
-				{
-					exchangePos += 11;  // Skip "exchange":
-					// Skip optional whitespace
-					while (exchangePos < data.GetLength() && (data[exchangePos] == ' ' || data[exchangePos] == '\t'))
-						exchangePos++;
-					// Skip opening quote
-					if (exchangePos < data.GetLength() && data[exchangePos] == '\"')
-						exchangePos++;
-					int endPos = data.Find(_T("\""), exchangePos);
-					if (endPos > exchangePos)
-						exchange = data.Mid(exchangePos, endPos - exchangePos);
-				}
-
-				// Extract LTP
-				int ltpPos = data.Find(_T("\"ltp\":"));
-				if (ltpPos >= 0)
-				{
-					ltpPos += 6;
-					int endPos = data.Find(_T(","), ltpPos);
-					if (endPos < 0) endPos = data.Find(_T("}"), ltpPos);
-					CString val = data.Mid(ltpPos, endPos - ltpPos);
-					ltp = (float)_tstof(val);
-				}
+				symbol = ExtractJsonStringValue(data, _T("symbol"));
+				exchange = ExtractJsonStringValue(data, _T("exchange"));
+				ltp = ExtractJsonFloatValue(data, _T("ltp"));
 
 				// Extract Mode 2 (Quote) fields: open / high / low / close /
 				// volume. Mode 1 (LTP) frames don't have these so the locals
 				// stay 0, and we'll preserve any earlier values when we copy
 				// into the cache (see below).
 				{
-					int p = data.Find(_T("\"open\":"));
-					if (p >= 0) {
-						p += 7;
-						int e = data.Find(_T(","), p);
-						if (e < 0) e = data.Find(_T("}"), p);
-						open = (float)_tstof(data.Mid(p, e - p));
-					}
-					p = data.Find(_T("\"high\":"));
-					if (p >= 0) {
-						p += 7;
-						int e = data.Find(_T(","), p);
-						if (e < 0) e = data.Find(_T("}"), p);
-						high = (float)_tstof(data.Mid(p, e - p));
-					}
-					p = data.Find(_T("\"low\":"));
-					if (p >= 0) {
-						p += 6;
-						int e = data.Find(_T(","), p);
-						if (e < 0) e = data.Find(_T("}"), p);
-						low = (float)_tstof(data.Mid(p, e - p));
-					}
-					p = data.Find(_T("\"close\":"));
-					if (p >= 0) {
-						p += 8;
-						int e = data.Find(_T(","), p);
-						if (e < 0) e = data.Find(_T("}"), p);
-						close = (float)_tstof(data.Mid(p, e - p));
-					}
-					p = data.Find(_T("\"volume\":"));
-					if (p >= 0) {
-						p += 9;
-						int e = data.Find(_T(","), p);
-						if (e < 0) e = data.Find(_T("}"), p);
-						volume = (float)_tstof(data.Mid(p, e - p));
-					}
-					p = data.Find(_T("\"oi\":"));
-					if (p >= 0) {
-						p += 5;
-						int e = data.Find(_T(","), p);
-						if (e < 0) e = data.Find(_T("}"), p);
-						oi = (float)_tstof(data.Mid(p, e - p));
-					}
+					open = ExtractJsonFloatValue(data, _T("open"));
+					high = ExtractJsonFloatValue(data, _T("high"));
+					low = ExtractJsonFloatValue(data, _T("low"));
+					close = ExtractJsonFloatValue(data, _T("close"));
+					if (close <= 0.0f)
+						close = ExtractJsonFloatValue(data, _T("prev_close"));
+					volume = ExtractJsonFloatValue(data, _T("volume"));
+					oi = ExtractJsonFloatValue(data, _T("oi"));
 				}
 
 				// Mode 3 (Depth) only: extract top-of-book bid/ask. These
 				// remain 0 for Mode 1 (LTP-only) frames which is fine -- we
 				// preserve the previously cached bid/ask in the RecentInfo
 				// update path below.
-				ExtractFirstDepthLevel(data, _T("buy"),  bidPx, bidQty);
-				ExtractFirstDepthLevel(data, _T("sell"), askPx, askQty);
+				if (!ExtractFirstDepthLevel(data, _T("buy"),  bidPx, bidQty))
+					ExtractFirstDepthLevel(data, _T("bids"), bidPx, bidQty);
+				if (!ExtractFirstDepthLevel(data, _T("sell"), askPx, askQty))
+					ExtractFirstDepthLevel(data, _T("asks"), askPx, askQty);
+
+				// Some websocket brokers include scalar bid/ask in quote frames.
+				// Keep them websocket-only and use them when depth arrays are absent.
+				if (bidPx <= 0.0f)
+					bidPx = ExtractJsonFloatValue(data, _T("bid"));
+				if (askPx <= 0.0f)
+					askPx = ExtractJsonFloatValue(data, _T("ask"));
 
 				// Extract last trade quantity - try both field names
 				// Legacy format: "last_trade_quantity":100
 				// Docs format: "ltq":100
-				int lastTradeQtyPos = data.Find(_T("\"ltq\":"));
-				if (lastTradeQtyPos >= 0)
-				{
-					lastTradeQtyPos += 6;
-					int endPos = data.Find(_T(","), lastTradeQtyPos);
-					if (endPos < 0) endPos = data.Find(_T("}"), lastTradeQtyPos);
-					CString val = data.Mid(lastTradeQtyPos, endPos - lastTradeQtyPos);
-					lastTradeQty = (float)_tstof(val);
-				}
-				else
-				{
-					lastTradeQtyPos = data.Find(_T("\"last_trade_quantity\":"));
-					if (lastTradeQtyPos >= 0)
-					{
-						lastTradeQtyPos += 22;
-						int endPos = data.Find(_T(","), lastTradeQtyPos);
-						if (endPos < 0) endPos = data.Find(_T("}"), lastTradeQtyPos);
-						CString val = data.Mid(lastTradeQtyPos, endPos - lastTradeQtyPos);
-						lastTradeQty = (float)_tstof(val);
-					}
-				}
+				lastTradeQty = ExtractJsonFloatValue(data, _T("ltq"));
+				if (lastTradeQty <= 0.0f)
+					lastTradeQty = ExtractJsonFloatValue(data, _T("last_trade_quantity"));
 
 				// NEW: Extract timestamp (supports both Unix milliseconds and ISO 8601 string)
 				// Server sends: "timestamp":1761157800000 (Unix milliseconds, no quotes)
@@ -3551,6 +3396,8 @@ BOOL ProcessWebSocketData(void)
 				if (timestampPos >= 0)
 				{
 					timestampPos += 12;  // Skip "timestamp":
+					while (timestampPos < data.GetLength() && IsJsonWhitespace(data[timestampPos]))
+						timestampPos++;
 
 					// Check if it's a string (starts with quote) or number
 					CString nextChar = data.Mid(timestampPos, 1);
@@ -3570,6 +3417,12 @@ BOOL ProcessWebSocketData(void)
 						timestamp.Trim();  // Remove whitespace
 					}
 				}
+
+				// LTP frames are trade ticks. Some brokers omit LTQ in this
+				// mode, so use a minimal non-zero size for AmiBroker T&S while
+				// still preserving real LTQ whenever the feed provides it.
+				if (bLtpFrame && ltp > 0.0f && lastTradeQty <= 0.0f)
+					lastTradeQty = 1.0f;
 
 				// Throttled logging - only log every 100th tick to avoid performance impact
 				static int s_wsCounter = 0;
@@ -3650,13 +3503,18 @@ BOOL ProcessWebSocketData(void)
 						// Top-of-book from Mode 3 Depth frames
 						if (bidPx  > 0.0f) { pRI->fBid     = bidPx;  pRI->iBidSize = (int)bidQty; bm |= RI_BID; }
 						if (askPx  > 0.0f) { pRI->fAsk     = askPx;  pRI->iAskSize = (int)askQty; bm |= RI_ASK; }
-						pRI->nBitmap = bm;
 
 						// nStatus drives Time & Sales row type. We compute the
 						// flags AFTER the field writes so we know exactly which
 						// values changed in THIS frame.
 						int newStatus = RI_STATUS_UPDATE | RI_STATUS_BARSREADY;
-						BOOL fireTrade  = (ltp   > 0.0f && ltp   != prevLast);
+						BOOL priceChanged = (ltp > 0.0f && ltp != prevLast);
+						// LTP mode is the websocket trade stream. Do not suppress
+						// Time & Sales rows when consecutive trades print at the
+						// same price; AmiBroker still needs RI_STATUS_TRADE.
+						BOOL fireTrade  = (ltp > 0.0f &&
+						                   (bLtpFrame ||
+						                    (!bQuoteFrame && !bDepthFrame && lastTradeQty > 0.0f)));
 						BOOL fireNewBid = (bidPx > 0.0f && bidPx != prevBid);
 						BOOL fireNewAsk = (askPx > 0.0f && askPx != prevAsk);
 						if (fireTrade)  newStatus |= RI_STATUS_TRADE;
@@ -3665,11 +3523,19 @@ BOOL ProcessWebSocketData(void)
 						pRI->nStatus = newStatus;
 
 						// nDateUpdate / nTimeUpdate MUST be refreshed every tick
-						// or AmiBroker's Quote Window won't update.
+						// and marked valid in nBitmap or AmiBroker's Quote Window
+						// and Time & Sales views won't refresh reliably.
 						CTime nowT = CTime::GetCurrentTime();
 						pRI->nDateUpdate = nowT.GetYear() * 10000 + nowT.GetMonth() * 100 + nowT.GetDay();
 						pRI->nTimeUpdate = nowT.GetHour() * 10000 + nowT.GetMinute() * 100 + nowT.GetSecond();
-						if (fireTrade) { pRI->nDateChange = pRI->nDateUpdate; pRI->nTimeChange = pRI->nTimeUpdate; }
+						bm |= RI_DATEUPDATE;
+						if (priceChanged || fireTrade || fireNewBid || fireNewAsk)
+						{
+							pRI->nDateChange = pRI->nDateUpdate;
+							pRI->nTimeChange = pRI->nTimeUpdate;
+							bm |= RI_DATECHANGE;
+						}
+						pRI->nBitmap = bm;
 						LeaveCriticalSection(&g_RecentInfoCS);
 
 						// Post on EVERY frame so AmiBroker re-reads the entry
