@@ -2503,6 +2503,67 @@ void NotifyBarsReadyForSymbol(const CString& ticker)
 	LeaveCriticalSection(&g_RecentInfoCS);
 
 	SendMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, (LPARAM)pInfo);
+	SendMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+}
+
+void ForceAmiBrokerRefreshAll(void)
+{
+#ifndef _AFX_NO_OLE_SUPPORT
+	HRESULT hrCo = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	BOOL bCoUninit = SUCCEEDED(hrCo);
+	if (FAILED(hrCo) && hrCo != RPC_E_CHANGED_MODE)
+	{
+		CString log;
+		log.Format(_T("OpenAlgo: RefreshAll skipped, CoInitializeEx failed hr=0x%08lX"), (unsigned long)hrCo);
+		OutputDebugString(log);
+		return;
+	}
+
+	CLSID clsid;
+	HRESULT hr = CLSIDFromProgID(L"Broker.Application", &clsid);
+	if (SUCCEEDED(hr))
+	{
+		IUnknown* pUnknown = NULL;
+		IDispatch* pDispatch = NULL;
+		hr = GetActiveObject(clsid, NULL, &pUnknown);
+		if (SUCCEEDED(hr) && pUnknown != NULL)
+		{
+			hr = pUnknown->QueryInterface(IID_IDispatch, (void**)&pDispatch);
+			pUnknown->Release();
+		}
+		else
+		{
+			hr = CoCreateInstance(clsid, NULL, CLSCTX_LOCAL_SERVER,
+			                      IID_IDispatch, (void**)&pDispatch);
+		}
+
+		if (SUCCEEDED(hr) && pDispatch != NULL)
+		{
+			OLECHAR methodName[] = L"RefreshAll";
+			LPOLESTR pMethodName = methodName;
+			DISPID dispid = DISPID_UNKNOWN;
+			hr = pDispatch->GetIDsOfNames(IID_NULL, &pMethodName, 1,
+			                              LOCALE_USER_DEFAULT, &dispid);
+			if (SUCCEEDED(hr))
+			{
+				DISPPARAMS params = { NULL, NULL, 0, 0 };
+				EXCEPINFO excep = {0};
+				UINT argErr = 0;
+				hr = pDispatch->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
+				                       DISPATCH_METHOD, &params, NULL,
+				                       &excep, &argErr);
+			}
+			pDispatch->Release();
+		}
+	}
+
+	CString log;
+	log.Format(_T("OpenAlgo: AmiBroker RefreshAll result hr=0x%08lX"), (unsigned long)hr);
+	OutputDebugString(log);
+
+	if (bCoUninit)
+		CoUninitialize();
+#endif
 }
 
 // GetRecentInfo is ONLY for the Realtime Quote Window + Time & Sales.
@@ -4252,7 +4313,11 @@ UINT __cdecl HttpWorkerThreadProc(LPVOID /*pArg*/)
 			OutputDebugString(log);
 
 			if (nResult > 0)
+			{
 				NotifyBarsReadyForSymbol(item.ticker);
+				if (item.nForceDays > 0)
+					ForceAmiBrokerRefreshAll();
+			}
 		}
 	}
 
