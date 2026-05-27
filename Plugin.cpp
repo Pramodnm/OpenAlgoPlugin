@@ -2207,10 +2207,49 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 	}
 	else
 	{
-		// 1-minute periodicity: daily first (chronologically older), then 1m
-		if (dailyCount > 0 && nSize > 0)
+		// 1-minute periodicity (also serves Mixed EOD/Intraday daily compression).
+		//
+		// Bug we're fixing here:
+		//   Previously we memcpy'd [all daily bars] then [all 1m bars]. Each
+		//   slice was sorted internally, but the concatenation was NOT --
+		//   today's daily EOD bar (Hour=31) sat *before* a 1-min bar from 30
+		//   days ago in the array. With AmiBroker's Mixed EOD/Intraday mode,
+		//   that out-of-order layout caused today's daily candle to absorb
+		//   the H/L of every 1-min bar in the file, displaying the month's
+		//   range on today's bar. Probe of the live history endpoint
+		//   confirmed the server returns the right per-day values; the bug
+		//   was purely the array layout.
+		//
+		// Fix: emit each daily EOD bar only for dates that have no 1-minute
+		// coverage. AmiBroker compresses the 1-minute range to daily on its
+		// own for the overlap window. The result is fully chronological with
+		// no duplicates, so today's daily candle is composed from today's
+		// (and only today's) 1-minute data + the live BarBuilder bar.
+		int dailyToCopy = dailyCount;
+		if (dailyCount > 0 && oneMinCount > 0)
 		{
-			int copyCount = min(dailyCount, nSize);
+			AmiDate firstOneMin = pCache->oneMinBars[0].DateTime;
+			unsigned int oY = firstOneMin.PackDate.Year;
+			unsigned int oM = firstOneMin.PackDate.Month;
+			unsigned int oD = firstOneMin.PackDate.Day;
+			dailyToCopy = 0;
+			for (int i = 0; i < dailyCount; i++)
+			{
+				AmiDate d = pCache->dailyBars[i].DateTime;
+				BOOL strictlyBefore =
+					(d.PackDate.Year <  oY) ||
+					(d.PackDate.Year == oY && d.PackDate.Month <  oM) ||
+					(d.PackDate.Year == oY && d.PackDate.Month == oM && d.PackDate.Day < oD);
+				if (strictlyBefore)
+					dailyToCopy = i + 1;
+				else
+					break;   // cache is sorted; everything after also overlaps
+			}
+		}
+
+		if (dailyToCopy > 0 && nSize > 0)
+		{
+			int copyCount = min(dailyToCopy, nSize);
 			memcpy(pQuotes, pCache->dailyBars.GetData(), copyCount * sizeof(struct Quotation));
 			nQty = copyCount;
 		}
