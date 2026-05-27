@@ -3630,10 +3630,17 @@ BOOL ProcessWebSocketData(void)
 						if (fireTrade) { pRI->nDateChange = pRI->nDateUpdate; pRI->nTimeChange = pRI->nTimeUpdate; }
 						LeaveCriticalSection(&g_RecentInfoCS);
 
-						// Always post when SOMETHING transitioned, so AmiBroker
-						// gets a fresh read AND so Time & Sales records the
-						// trade/bid/ask event with the right row type.
-						if (g_hAmiBrokerWnd != NULL && (fireTrade || fireNewBid || fireNewAsk))
+						// Post on EVERY frame so AmiBroker re-reads the entry
+						// and the Quote Window keeps refreshing. Previous version
+						// only posted on ltp/bid/ask transitions, which let the
+						// Quote Window freeze any time a symbol's price held
+						// flat for a few seconds (which it routinely does for
+						// less-active NSE names and even MCX between trades).
+						// Time & Sales row type is still driven by the
+						// RI_STATUS_TRADE / NEW_BID / NEW_ASK bits computed
+						// above, so one event = one row, regardless of how
+						// many "value unchanged" frames are in between.
+						if (g_hAmiBrokerWnd != NULL)
 						{
 							PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE,
 							            0, (LPARAM)pRI);
