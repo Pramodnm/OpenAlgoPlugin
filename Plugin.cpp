@@ -2476,6 +2476,35 @@ struct RecentInfo* GetOrCreateRecentInfoEntry(const CString& ticker)
 	return pInfo;
 }
 
+void NotifyBarsReadyForSymbol(const CString& ticker)
+{
+	if (g_hAmiBrokerWnd == NULL)
+		return;
+
+	if (!g_bRecentInfoCSInit)
+	{
+		PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+		return;
+	}
+
+	struct RecentInfo* pInfo = GetOrCreateRecentInfoEntry(ticker);
+	if (pInfo == NULL)
+	{
+		PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+		return;
+	}
+
+	CTime nowT = CTime::GetCurrentTime();
+	EnterCriticalSection(&g_RecentInfoCS);
+	pInfo->nStatus = RI_STATUS_UPDATE | RI_STATUS_BARSREADY;
+	pInfo->nDateUpdate = nowT.GetYear() * 10000 + nowT.GetMonth() * 100 + nowT.GetDay();
+	pInfo->nTimeUpdate = nowT.GetHour() * 10000 + nowT.GetMinute() * 100 + nowT.GetSecond();
+	pInfo->nBitmap |= RI_DATEUPDATE;
+	LeaveCriticalSection(&g_RecentInfoCS);
+
+	SendMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, (LPARAM)pInfo);
+}
+
 // GetRecentInfo is ONLY for the Realtime Quote Window + Time & Sales.
 // WS-only -- no HTTP fallback. The broker's /api/v1/quotes endpoint is
 // severely rate-limited and was driving the empty rows for slower symbols.
@@ -4136,8 +4165,9 @@ void QueueHttpFetch(const CString& ticker, int nPeriodicity, int nForceDays)
 }
 
 // Worker thread: drains the queue, fetches HTTP for each item, and updates
-// the per-symbol cache. Posts WM_USER_STREAMING_UPDATE on success so the
-// AmiBroker UI thread will re-read the cache through GetQuotesEx.
+// the per-symbol cache. Marks the symbol's RecentInfo as BARSREADY and sends
+// WM_USER_STREAMING_UPDATE on success so AmiBroker re-reads GetQuotesEx for
+// the active chart without needing a symbol switch.
 UINT __cdecl HttpWorkerThreadProc(LPVOID /*pArg*/)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
@@ -4221,8 +4251,8 @@ UINT __cdecl HttpWorkerThreadProc(LPVOID /*pArg*/)
 				(LPCTSTR)item.ticker);
 			OutputDebugString(log);
 
-			if (nResult > 0 && g_hAmiBrokerWnd != NULL)
-				PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+			if (nResult > 0)
+				NotifyBarsReadyForSymbol(item.ticker);
 		}
 	}
 
