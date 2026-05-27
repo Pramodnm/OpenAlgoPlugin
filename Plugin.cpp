@@ -324,80 +324,175 @@ CString BuildOpenAlgoURL(const CString& server, int port, const CString& endpoin
 }
 
 // ---------------------------------------------------------------------------
-// Direct-registry API-key persistence
+// API-key persistence
 //
-// Background: CWinApp::WriteProfileString was reliably saving every other
-// setting (Server, Port, WebSocketUrl, RefreshInterval, ...) but the ApiKey
-// specifically kept disappearing from HKCU\Software\OpenAlgo\OpenAlgo\OpenAlgo
-// across sessions. The user had to re-enter it every time. Bypass MFC and
-// use the Win32 registry API directly so the save path is unambiguous.
+// History on this machine:
+//   1. CWinApp::WriteProfileString silently dropped just the ApiKey value
+//      across sessions, even though Server/Port/etc persisted fine.
+//   2. Switching to direct RegSetValueEx (still in the same MFC-style
+//      HKCU\Software\OpenAlgo\... subtree) still ended up with the whole
+//      subkey wiped after each AmiBroker restart. Something on this machine
+//      is cleaning that registry tree (AV, group policy, optimization
+//      utility, etc.). PowerShell round-trips through the same Win32 API
+//      against the same path do work, so the Win32 call is correct; the
+//      registry location itself is the problem.
+//
+// Solution: store the API key in a plain text file under
+//   %LOCALAPPDATA%\OpenAlgoPlugin\settings.dat
+// Files don't get scrubbed by registry cleaners. We still write the
+// registry value too as a secondary store. On read we try the file first
+// and fall back to the registry; the writeback re-syncs whichever was
+// missing so the two locations stay consistent over time.
 // ---------------------------------------------------------------------------
+
+#include <shlobj.h>   // SHGetFolderPath
+#pragma comment(lib, "Shell32.lib")
 
 static const TCHAR* kOpenAlgoRegPath = _T("Software\\OpenAlgo\\OpenAlgo\\OpenAlgo");
 
-BOOL WriteApiKeyDirect(const CString& key)
+// Returns "<LOCALAPPDATA>\OpenAlgoPlugin\settings.dat", creating the folder
+// if needed. Returns empty string on failure (very rare).
+static CString GetApiKeyFilePath()
 {
-	HKEY hKey = NULL;
-	DWORD disposition = 0;
-	LONG createResult = RegCreateKeyEx(
-		HKEY_CURRENT_USER,
-		kOpenAlgoRegPath,
-		0,
-		NULL,
-		REG_OPTION_NON_VOLATILE,
-		KEY_WRITE,
-		NULL,
-		&hKey,
-		&disposition);
+	CString path;
+	TCHAR buf[MAX_PATH] = {0};
+	HRESULT hr = SHGetFolderPath(NULL, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE,
+	                             NULL, SHGFP_TYPE_CURRENT, buf);
+	if (FAILED(hr) || buf[0] == 0)
+		return path;
 
-	if (createResult != ERROR_SUCCESS || hKey == NULL)
+	path.Format(_T("%s\\OpenAlgoPlugin"), buf);
+	::CreateDirectory(path, NULL);   // OK if it already exists
+	path += _T("\\settings.dat");
+	return path;
+}
+
+static BOOL WriteApiKeyToFile(const CString& key)
+{
+	CString path = GetApiKeyFilePath();
+	if (path.IsEmpty()) return FALSE;
+
+	// Write atomically: settings.dat.tmp first, then MoveFileEx replace.
+	// Avoids leaving an empty file on crash mid-write.
+	CString tmp = path + _T(".tmp");
+
+	HANDLE h = ::CreateFile(tmp, GENERIC_WRITE, 0, NULL,
+	                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE)
 	{
 		CString log;
-		log.Format(_T("OpenAlgo: WriteApiKeyDirect - RegCreateKeyEx failed err=%ld"), createResult);
+		log.Format(_T("OpenAlgo: WriteApiKeyToFile CreateFile failed err=%lu path=%s"),
+			GetLastError(), (LPCTSTR)tmp);
 		OutputDebugString(log);
 		return FALSE;
 	}
 
-	DWORD dataBytes = (DWORD)((key.GetLength() + 1) * sizeof(TCHAR));
-	LONG setResult = RegSetValueEx(
-		hKey,
-		_T("ApiKey"),
-		0,
-		REG_SZ,
-		(const BYTE*)(LPCTSTR)key,
-		dataBytes);
+	// Single line: key=<value>\n  (so we can grow this later if we want to
+	// add more settings without breaking older parsers).
+	CStringA line;
+	line.Format("key=%s\n", (LPCSTR)CStringA(key));
+	DWORD written = 0;
+	BOOL wrote = ::WriteFile(h, (LPCSTR)line, (DWORD)line.GetLength(), &written, NULL);
+	::FlushFileBuffers(h);
+	::CloseHandle(h);
 
-	RegCloseKey(hKey);
+	if (!wrote || written != (DWORD)line.GetLength())
+	{
+		CString log;
+		log.Format(_T("OpenAlgo: WriteApiKeyToFile WriteFile failed err=%lu wrote=%lu"),
+			GetLastError(), written);
+		OutputDebugString(log);
+		::DeleteFile(tmp);
+		return FALSE;
+	}
+
+	if (!::MoveFileEx(tmp, path, MOVEFILE_REPLACE_EXISTING))
+	{
+		CString log;
+		log.Format(_T("OpenAlgo: WriteApiKeyToFile MoveFileEx failed err=%lu"),
+			GetLastError());
+		OutputDebugString(log);
+		::DeleteFile(tmp);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+static BOOL ReadApiKeyFromFile(CString& outKey)
+{
+	outKey.Empty();
+	CString path = GetApiKeyFilePath();
+	if (path.IsEmpty()) return FALSE;
+
+	HANDLE h = ::CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+	                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) return FALSE;
+
+	char raw[1024] = {0};
+	DWORD read = 0;
+	::ReadFile(h, raw, sizeof(raw) - 1, &read, NULL);
+	::CloseHandle(h);
+	if (read == 0) return FALSE;
+
+	CStringA content(raw, (int)read);
+	int eqPos = content.Find("key=");
+	if (eqPos < 0) return FALSE;
+	int start = eqPos + 4;
+	int end = start;
+	while (end < content.GetLength() && content[end] != '\r' && content[end] != '\n')
+		end++;
+	if (end <= start) return FALSE;
+
+	outKey = CString(CStringA(content.Mid(start, end - start)));
+	return !outKey.IsEmpty();
+}
+
+// Write to both the file (canonical) and the registry (legacy/secondary).
+// Either success counts as a successful write -- we only fail if both fail.
+BOOL WriteApiKeyDirect(const CString& key)
+{
+	BOOL fileOk = WriteApiKeyToFile(key);
+
+	// Best-effort registry write -- not fatal if it fails.
+	BOOL regOk = FALSE;
+	HKEY hKey = NULL;
+	DWORD disposition = 0;
+	if (RegCreateKeyEx(HKEY_CURRENT_USER, kOpenAlgoRegPath, 0, NULL,
+	                   REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL,
+	                   &hKey, &disposition) == ERROR_SUCCESS && hKey)
+	{
+		DWORD dataBytes = (DWORD)((key.GetLength() + 1) * sizeof(TCHAR));
+		regOk = (RegSetValueEx(hKey, _T("ApiKey"), 0, REG_SZ,
+		                       (const BYTE*)(LPCTSTR)key, dataBytes) == ERROR_SUCCESS);
+		RegCloseKey(hKey);
+	}
 
 	CString log;
 	int n = key.GetLength();
 	CString mask;
 	if (n > 8) mask.Format(_T("%s...%s"), (LPCTSTR)key.Left(4), (LPCTSTR)key.Right(4));
 	else       mask = _T("(short)");
-	log.Format(_T("OpenAlgo: WriteApiKeyDirect ApiKey=%s len=%d setResult=%ld"),
-		(LPCTSTR)mask, n, setResult);
+	log.Format(_T("OpenAlgo: WriteApiKeyDirect ApiKey=%s len=%d file=%d reg=%d"),
+		(LPCTSTR)mask, n, fileOk, regOk);
 	OutputDebugString(log);
 
-	return (setResult == ERROR_SUCCESS);
+	return (fileOk || regOk);
 }
 
+// Try file first; fall back to registry. If only one source has the value,
+// write the other so they re-sync.
 BOOL ReadApiKeyDirect(CString& outKey)
 {
 	outKey.Empty();
 
-	HKEY hKey = NULL;
-	LONG openResult = RegOpenKeyEx(
-		HKEY_CURRENT_USER,
-		kOpenAlgoRegPath,
-		0,
-		KEY_READ,
-		&hKey);
+	if (ReadApiKeyFromFile(outKey) && !outKey.IsEmpty())
+		return TRUE;
 
-	if (openResult != ERROR_SUCCESS || hKey == NULL)
-	{
-		// Key absent on a fresh install. Not an error worth logging loudly.
+	HKEY hKey = NULL;
+	if (RegOpenKeyEx(HKEY_CURRENT_USER, kOpenAlgoRegPath, 0,
+	                 KEY_READ, &hKey) != ERROR_SUCCESS || hKey == NULL)
 		return FALSE;
-	}
 
 	DWORD dataType = 0;
 	DWORD dataBytes = 0;
@@ -414,9 +509,7 @@ BOOL ReadApiKeyDirect(CString& outKey)
 	DWORD copyBytes = dataBytes;
 	LONG readResult = RegQueryValueEx(hKey, _T("ApiKey"), NULL, &dataType,
 		(LPBYTE)buf, &copyBytes);
-	// Releasing without an explicit length lets CString find the null terminator
 	outKey.ReleaseBuffer();
-
 	RegCloseKey(hKey);
 
 	if (readResult != ERROR_SUCCESS)
@@ -424,6 +517,11 @@ BOOL ReadApiKeyDirect(CString& outKey)
 		outKey.Empty();
 		return FALSE;
 	}
+
+	// Recovered from registry -- write back to the file so next time the
+	// file path serves it (in case the registry tree gets wiped again).
+	if (!outKey.IsEmpty())
+		WriteApiKeyToFile(outKey);
 
 	return TRUE;
 }

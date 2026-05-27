@@ -134,12 +134,11 @@ void COpenAlgoConfigDlg::OnOK()
 	CWinApp* pApp = AfxGetApp();
 
 	BOOL bSrv  = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("Server"),        g_oServer)        : FALSE;
-	// API key write is done DIRECTLY via the registry API. MFC's
-	// WriteProfileString was reliably saving everything else here but kept
-	// dropping just the ApiKey value -- presumably some quirk of the password
-	// edit DDX flow or MFC's registry helper. WriteApiKeyDirect uses
-	// RegSetValueEx against the same HKCU\Software\OpenAlgo\... path so the
-	// existing read path continues to see it.
+	// API key is persisted independent of MFC's profile system. The primary
+	// store is now a file under %LOCALAPPDATA%\OpenAlgoPlugin\settings.dat,
+	// because something on this machine has been wiping the registry subkey
+	// between sessions. WriteApiKeyDirect writes both the file and the
+	// registry; either landing is enough for a successful save.
 	BOOL bKey  = WriteApiKeyDirect(g_oApiKey);
 	BOOL bWs   = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("WebSocketUrl"),  g_oWebSocketUrl)  : FALSE;
 	BOOL bPort = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("Port"),          g_nPortNumber)    : FALSE;
