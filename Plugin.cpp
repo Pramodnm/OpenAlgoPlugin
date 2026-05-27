@@ -23,6 +23,7 @@
 #define TIMER_REFRESH 199
 #define TIMER_WEBSOCKET 200  // High-frequency timer for WebSocket data processing
 #define RETRY_COUNT 8
+#define CONNECTION_HEARTBEAT_INTERVAL_SEC 30
 
 ////////////////////////////////////////
 // Plugin Info Structure
@@ -44,7 +45,8 @@ static struct PluginInfo oPluginInfo =
 ///////////////////////////////
 HWND g_hAmiBrokerWnd = NULL;
 int g_nPortNumber = 5000;
-int g_nRefreshInterval = 5;
+int g_nRefreshInterval = CONNECTION_HEARTBEAT_INTERVAL_SEC;
+int g_nBackfillRefreshIntervalSec = 30;
 int g_nTimeShift = 0;
 CString g_oServer = _T("127.0.0.1");
 CString g_oApiKey = _T("");  // API Key for authentication
@@ -121,7 +123,7 @@ typedef CArray< struct Quotation, struct Quotation > CQuoteArray;
 
 // Real-time configuration (non-static so they can be accessed from OpenAlgoConfigDlg)
 BOOL g_bRealTimeCandlesEnabled = TRUE;  // Default: enabled
-int g_nBackfillIntervalMs = 5000;       // HTTP backfill every 5 seconds
+int g_nBackfillIntervalMs = 30000;      // Legacy mirror of g_nBackfillRefreshIntervalSec
 
 // HTTP response caching (performance optimization)
 // Cache HTTP responses to avoid calling HTTP API on every GetQuotesEx() call
@@ -223,7 +225,6 @@ static volatile LONG g_bWsReaderShouldStop = 0;
 
 // Cache freshness windows. Stale entries trigger a background refresh but the
 // stale data is still served immediately so the chart never goes blank.
-static const DWORD ONEMIN_CACHE_LIFETIME_MS = 30000;     // refresh 1m every 30s
 static const DWORD DAILY_CACHE_LIFETIME_MS  = 3600000;   // refresh daily every 1h
 
 // Forward declarations
@@ -276,6 +277,19 @@ int CompareQuotations(const void* a, const void* b);
 static BOOL IsJsonWhitespace(TCHAR ch)
 {
 	return ch == _T(' ') || ch == _T('\t') || ch == _T('\r') || ch == _T('\n');
+}
+
+static int ClampBackfillRefreshIntervalSec(int seconds)
+{
+	if (seconds < 5) return 5;
+	if (seconds > 3600) return 3600;
+	return seconds;
+}
+
+static DWORD GetOneMinCacheLifetimeMs(void)
+{
+	int seconds = ClampBackfillRefreshIntervalSec(g_nBackfillRefreshIntervalSec);
+	return (DWORD)seconds * 1000;
 }
 
 // Finds the first character of a JSON value after "key":, allowing the
@@ -1449,7 +1463,10 @@ PLUGINAPI int Init(void)
 
 		g_oWebSocketUrl = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("WebSocketUrl"), _T("ws://127.0.0.1:8765"));  // Load WebSocket URL
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
-		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
+		g_nRefreshInterval = CONNECTION_HEARTBEAT_INTERVAL_SEC;
+		g_nBackfillRefreshIntervalSec = ClampBackfillRefreshIntervalSec(
+			AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("BackfillRefreshIntervalSec"), 30));
+		g_nBackfillIntervalMs = g_nBackfillRefreshIntervalSec * 1000;
 		g_nTimeShift = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("TimeShift"), 0);
 
 		// Mask key in log so DbgView traces stay safe
@@ -1466,7 +1483,9 @@ PLUGINAPI int Init(void)
 
 		// Real-time candle building settings
 		g_bRealTimeCandlesEnabled = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("EnableRealTimeCandles"), 1);  // Default: enabled
-		g_nBackfillIntervalMs = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("BackfillIntervalMs"), 5000);  // Default: 5 seconds
+		// Backfill cadence is user-controlled via BackfillRefreshIntervalSec.
+		// BackfillIntervalMs is retained as a legacy mirror for diagnostics.
+		g_nBackfillIntervalMs = g_nBackfillRefreshIntervalSec * 1000;
 
 		g_nStatus = STATUS_WAIT;
 		g_bPluginInitialized = TRUE;
@@ -1518,8 +1537,9 @@ PLUGINAPI int Init(void)
 
 		// Log real-time settings
 		CString rtMsg;
-		rtMsg.Format(_T("OpenAlgo: Real-Time Candles Enabled = %d, Backfill Interval = %d ms"),
-			g_bRealTimeCandlesEnabled, g_nBackfillIntervalMs);
+		rtMsg.Format(_T("OpenAlgo: Real-Time Candles Enabled = %d, Backfill Refresh = %d sec, Heartbeat = %d sec"),
+			g_bRealTimeCandlesEnabled, g_nBackfillRefreshIntervalSec,
+			CONNECTION_HEARTBEAT_INTERVAL_SEC);
 		OutputDebugString(rtMsg);
 
 		// Initialize WebSocket connection early (don't wait for GetRecentInfo)
@@ -1938,7 +1958,9 @@ VOID CALLBACK OnTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
 			if (idEvent == TIMER_INIT)
 			{
 				KillTimer(g_hAmiBrokerWnd, TIMER_INIT);
-				SetTimer(g_hAmiBrokerWnd, TIMER_REFRESH, g_nRefreshInterval * 1000, (TIMERPROC)OnTimerProc);
+				SetTimer(g_hAmiBrokerWnd, TIMER_REFRESH,
+					CONNECTION_HEARTBEAT_INTERVAL_SEC * 1000,
+					(TIMERPROC)OnTimerProc);
 			}
 		}
 	}
@@ -1967,7 +1989,10 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 		}
 		g_oWebSocketUrl = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("WebSocketUrl"), _T("ws://127.0.0.1:8765"));  // Load WebSocket URL
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
-		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
+		g_nRefreshInterval = CONNECTION_HEARTBEAT_INTERVAL_SEC;
+		g_nBackfillRefreshIntervalSec = ClampBackfillRefreshIntervalSec(
+			AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("BackfillRefreshIntervalSec"), 30));
+		g_nBackfillIntervalMs = g_nBackfillRefreshIntervalSec * 1000;
 
 		g_nStatus = STATUS_WAIT;
 		g_nRetryCount = RETRY_COUNT;
@@ -2286,7 +2311,7 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 	BOOL bDailyStale  = (pCache->lastDailyFetch == 0) ||
 	                    ((now - pCache->lastDailyFetch) > DAILY_CACHE_LIFETIME_MS);
 	BOOL bOneMinStale = (pCache->lastOneMinFetch == 0) ||
-	                    ((now - pCache->lastOneMinFetch) > ONEMIN_CACHE_LIFETIME_MS);
+	                    ((now - pCache->lastOneMinFetch) > GetOneMinCacheLifetimeMs());
 
 	if (nPeriodicity == 86400)
 	{
@@ -4375,11 +4400,27 @@ UINT __cdecl HttpWorkerThreadProc(LPVOID /*pArg*/)
 			}
 			memset(tmpBars, 0, TMP_SIZE * sizeof(struct Quotation));
 
+			SymbolBarCache* pCache = GetOrCreateSymbolBarCache(item.ticker);
+			int nSeedLastValid = -1;
+			if (item.nForceDays <= 0)
+			{
+				EnterCriticalSection(&g_SymbolBarCacheCS);
+				CArray<struct Quotation, struct Quotation>& cachedBars =
+					(item.nPeriodicity == 60) ? pCache->oneMinBars : pCache->dailyBars;
+				int seedCount = min((int)cachedBars.GetCount(), TMP_SIZE);
+				if (seedCount > 0)
+				{
+					memcpy(tmpBars, cachedBars.GetData(),
+					       seedCount * sizeof(struct Quotation));
+					nSeedLastValid = seedCount - 1;
+				}
+				LeaveCriticalSection(&g_SymbolBarCacheCS);
+			}
+
 			int nResult = GetOpenAlgoHistory(item.ticker, item.nPeriodicity,
-			                                 -1, TMP_SIZE, tmpBars,
+			                                 nSeedLastValid, TMP_SIZE, tmpBars,
 			                                 item.nForceDays);
 
-			SymbolBarCache* pCache = GetOrCreateSymbolBarCache(item.ticker);
 			DWORD now = (DWORD)GetTickCount64();
 
 			EnterCriticalSection(&g_SymbolBarCacheCS);

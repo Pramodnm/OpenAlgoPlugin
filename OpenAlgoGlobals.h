@@ -18,6 +18,7 @@ enum OpenAlgoStatus
 extern HWND g_hAmiBrokerWnd;
 extern int g_nPortNumber;
 extern int g_nRefreshInterval;
+extern int g_nBackfillRefreshIntervalSec;
 extern int g_nTimeShift;
 extern CString g_oServer;
 extern CString g_oApiKey;  // API Key for authentication

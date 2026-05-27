@@ -44,8 +44,8 @@ void COpenAlgoConfigDlg::DoDataExchange(CDataExchange* pDX)
 	DDX_Text(pDX, IDC_PORT_EDIT, g_nPortNumber);
 	DDV_MinMaxInt(pDX, g_nPortNumber, 1, 65535);
 
-	DDX_Text(pDX, IDC_INTERVAL_EDIT, g_nRefreshInterval);
-	DDV_MinMaxInt(pDX, g_nRefreshInterval, 1, 3600); // 1 second to 1 hour
+	DDX_Text(pDX, IDC_INTERVAL_EDIT, g_nBackfillRefreshIntervalSec);
+	DDV_MinMaxInt(pDX, g_nBackfillRefreshIntervalSec, 5, 3600); // 5 seconds to 1 hour
 
 	DDX_Text(pDX, IDC_TIMESHIFT_EDIT, g_nTimeShift);
 	DDV_MinMaxInt(pDX, g_nTimeShift, -48, 48);
@@ -142,7 +142,10 @@ void COpenAlgoConfigDlg::OnOK()
 	BOOL bKey  = WriteApiKeyDirect(g_oApiKey);
 	BOOL bWs   = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("WebSocketUrl"),  g_oWebSocketUrl)  : FALSE;
 	BOOL bPort = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("Port"),          g_nPortNumber)    : FALSE;
+	g_nRefreshInterval = 30; // Connection/status heartbeat is fixed internally.
+	g_nBackfillIntervalMs = g_nBackfillRefreshIntervalSec * 1000;
 	BOOL bIv   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("RefreshInterval"), g_nRefreshInterval) : FALSE;
+	BOOL bBri  = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("BackfillRefreshIntervalSec"), g_nBackfillRefreshIntervalSec) : FALSE;
 	BOOL bTs   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("TimeShift"),     g_nTimeShift)     : FALSE;
 	BOOL bRt   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("EnableRealTimeCandles"), g_bRealTimeCandlesEnabled ? 1 : 0) : FALSE;
 	BOOL bBf   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("BackfillIntervalMs"),    g_nBackfillIntervalMs)            : FALSE;
@@ -156,9 +159,9 @@ void COpenAlgoConfigDlg::OnOK()
 	CString log;
 	log.Format(
 		_T("OpenAlgo: OnOK saved ApiKey=%s Server=%s "
-		   "(srv=%d key=%d ws=%d port=%d iv=%d ts=%d rt=%d bf=%d verify=%d)"),
+		   "(srv=%d key=%d ws=%d port=%d heartbeat=%d backfill=%d ts=%d rt=%d bf=%d verify=%d)"),
 		(LPCTSTR)MaskKey(g_oApiKey), (LPCTSTR)g_oServer,
-		bSrv, bKey, bWs, bPort, bIv, bTs, bRt, bBf, bVerify);
+		bSrv, bKey, bWs, bPort, bIv, bBri, bTs, bRt, bBf, bVerify);
 	OutputDebugString(log);
 
 	if (!bKey || !bVerify)
