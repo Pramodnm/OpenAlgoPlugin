@@ -72,6 +72,16 @@ static CMap<CString, LPCTSTR, BOOL, BOOL> g_SubscribedSymbols;
 static CRITICAL_SECTION g_WebSocketCriticalSection;
 static BOOL g_bCriticalSectionInitialized = FALSE;
 
+// Send-side mutex. WS send() must be serialized across the UI thread
+// (SubscribeToSymbol / UnsubscribeFromSymbol via SendWebSocketFrame) and the
+// WS reader thread (PING / PONG). Without this, two simultaneous send()s
+// interleave bytes on the wire, the server gets a malformed frame, and
+// closes the connection with code 1006 (abnormal closure, no close frame).
+// That was the cause of the ~20s reconnect cycle visible in the OpenAlgo
+// server log.
+static CRITICAL_SECTION g_WebSocketSendCS;
+static BOOL g_bWebSocketSendCSInit = FALSE;
+
 // Cache for recent quotes
 struct QuoteCache {
 	CString symbol;
@@ -1519,6 +1529,10 @@ PLUGINAPI int Init(void)
 		InitializeCriticalSection(&g_WebSocketCriticalSection);
 		g_bCriticalSectionInitialized = TRUE;
 
+		// Send-side serialization (see comment near declaration)
+		InitializeCriticalSection(&g_WebSocketSendCS);
+		g_bWebSocketSendCSInit = TRUE;
+
 		// Initialize critical section for BarBuilder operations
 		InitializeCriticalSection(&g_BarBuilderCriticalSection);
 		g_bBarBuilderCriticalSectionInitialized = TRUE;
@@ -1603,6 +1617,12 @@ PLUGINAPI int Release(void)
 	{
 		DeleteCriticalSection(&g_WebSocketCriticalSection);
 		g_bCriticalSectionInitialized = FALSE;
+	}
+
+	if (g_bWebSocketSendCSInit)
+	{
+		DeleteCriticalSection(&g_WebSocketSendCS);
+		g_bWebSocketSendCSInit = FALSE;
 	}
 
 	if (g_bBarBuilderCriticalSectionInitialized)
@@ -2587,8 +2607,22 @@ BOOL SendWebSocketFrame(const CString& message)
 		frame[frameLen++] = messageA[i] ^ maskKey[i % 4];
 	}
 	
-	// Send the frame
-	int sent = send(g_websocket, (char*)frame, frameLen, 0);
+	// Send the frame. Serialize all WS send()s through g_WebSocketSendCS so
+	// the worker thread's PING/PONG can't interleave bytes with this frame
+	// and trip the server's "abnormal close 1006" handler.
+	int sent = 0;
+	if (g_bWebSocketSendCSInit)
+	{
+		EnterCriticalSection(&g_WebSocketSendCS);
+		if (g_websocket != INVALID_SOCKET)
+			sent = send(g_websocket, (char*)frame, frameLen, 0);
+		LeaveCriticalSection(&g_WebSocketSendCS);
+	}
+	else
+	{
+		if (g_websocket != INVALID_SOCKET)
+			sent = send(g_websocket, (char*)frame, frameLen, 0);
+	}
 	return (sent == frameLen);
 }
 
@@ -3220,7 +3254,11 @@ BOOL ProcessWebSocketData(void)
 		// Send WebSocket ping frame (opcode 0x09)
 		unsigned char pingFrame[6] = {0x89, 0x84, 0x00, 0x00, 0x00, 0x00}; // Ping with 4-byte mask
 		GenerateWebSocketMaskKey(&pingFrame[2]);
-		send(g_websocket, (char*)pingFrame, 6, 0);
+		// Serialize with UI-thread SendWebSocketFrame -- see g_WebSocketSendCS comment
+		if (g_bWebSocketSendCSInit) EnterCriticalSection(&g_WebSocketSendCS);
+		if (g_websocket != INVALID_SOCKET)
+			send(g_websocket, (char*)pingFrame, 6, 0);
+		if (g_bWebSocketSendCSInit) LeaveCriticalSection(&g_WebSocketSendCS);
 		lastPingTime = currentTime;
 		OutputDebugString(_T("OpenAlgo: Sent WebSocket ping"));
 	}
@@ -3319,8 +3357,12 @@ BOOL ProcessWebSocketData(void)
 					pongFrame[frameLen++] = payloadBytes[i] ^ maskKey[i % 4];
 				}
 
-				// Send PONG with echoed payload
-				send(g_websocket, (char*)pongFrame, frameLen, 0);
+				// Send PONG with echoed payload. Serialize with the UI thread's
+				// SubscribeToSymbol send() to avoid interleaved bytes on the wire.
+				if (g_bWebSocketSendCSInit) EnterCriticalSection(&g_WebSocketSendCS);
+				if (g_websocket != INVALID_SOCKET)
+					send(g_websocket, (char*)pongFrame, frameLen, 0);
+				if (g_bWebSocketSendCSInit) LeaveCriticalSection(&g_WebSocketSendCS);
 
 				CString pongLog;
 				pongLog.Format(_T("OpenAlgo: Received PING with %d-byte payload, sent PONG with echoed payload"), payloadLen);
