@@ -323,6 +323,111 @@ CString BuildOpenAlgoURL(const CString& server, int port, const CString& endpoin
 	return result;
 }
 
+// ---------------------------------------------------------------------------
+// Direct-registry API-key persistence
+//
+// Background: CWinApp::WriteProfileString was reliably saving every other
+// setting (Server, Port, WebSocketUrl, RefreshInterval, ...) but the ApiKey
+// specifically kept disappearing from HKCU\Software\OpenAlgo\OpenAlgo\OpenAlgo
+// across sessions. The user had to re-enter it every time. Bypass MFC and
+// use the Win32 registry API directly so the save path is unambiguous.
+// ---------------------------------------------------------------------------
+
+static const TCHAR* kOpenAlgoRegPath = _T("Software\\OpenAlgo\\OpenAlgo\\OpenAlgo");
+
+BOOL WriteApiKeyDirect(const CString& key)
+{
+	HKEY hKey = NULL;
+	DWORD disposition = 0;
+	LONG createResult = RegCreateKeyEx(
+		HKEY_CURRENT_USER,
+		kOpenAlgoRegPath,
+		0,
+		NULL,
+		REG_OPTION_NON_VOLATILE,
+		KEY_WRITE,
+		NULL,
+		&hKey,
+		&disposition);
+
+	if (createResult != ERROR_SUCCESS || hKey == NULL)
+	{
+		CString log;
+		log.Format(_T("OpenAlgo: WriteApiKeyDirect - RegCreateKeyEx failed err=%ld"), createResult);
+		OutputDebugString(log);
+		return FALSE;
+	}
+
+	DWORD dataBytes = (DWORD)((key.GetLength() + 1) * sizeof(TCHAR));
+	LONG setResult = RegSetValueEx(
+		hKey,
+		_T("ApiKey"),
+		0,
+		REG_SZ,
+		(const BYTE*)(LPCTSTR)key,
+		dataBytes);
+
+	RegCloseKey(hKey);
+
+	CString log;
+	int n = key.GetLength();
+	CString mask;
+	if (n > 8) mask.Format(_T("%s...%s"), (LPCTSTR)key.Left(4), (LPCTSTR)key.Right(4));
+	else       mask = _T("(short)");
+	log.Format(_T("OpenAlgo: WriteApiKeyDirect ApiKey=%s len=%d setResult=%ld"),
+		(LPCTSTR)mask, n, setResult);
+	OutputDebugString(log);
+
+	return (setResult == ERROR_SUCCESS);
+}
+
+BOOL ReadApiKeyDirect(CString& outKey)
+{
+	outKey.Empty();
+
+	HKEY hKey = NULL;
+	LONG openResult = RegOpenKeyEx(
+		HKEY_CURRENT_USER,
+		kOpenAlgoRegPath,
+		0,
+		KEY_READ,
+		&hKey);
+
+	if (openResult != ERROR_SUCCESS || hKey == NULL)
+	{
+		// Key absent on a fresh install. Not an error worth logging loudly.
+		return FALSE;
+	}
+
+	DWORD dataType = 0;
+	DWORD dataBytes = 0;
+	LONG sizeResult = RegQueryValueEx(hKey, _T("ApiKey"), NULL, &dataType, NULL, &dataBytes);
+	if (sizeResult != ERROR_SUCCESS || dataType != REG_SZ || dataBytes == 0)
+	{
+		RegCloseKey(hKey);
+		return FALSE;
+	}
+
+	int chars = (int)(dataBytes / sizeof(TCHAR));
+	if (chars < 1) chars = 1;
+	TCHAR* buf = outKey.GetBuffer(chars);
+	DWORD copyBytes = dataBytes;
+	LONG readResult = RegQueryValueEx(hKey, _T("ApiKey"), NULL, &dataType,
+		(LPBYTE)buf, &copyBytes);
+	// Releasing without an explicit length lets CString find the null terminator
+	outKey.ReleaseBuffer();
+
+	RegCloseKey(hKey);
+
+	if (readResult != ERROR_SUCCESS)
+	{
+		outKey.Empty();
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 // Extract exchange from ticker format (e.g., "RELIANCE-NSE" -> "NSE")
 CString GetExchangeFromTicker(LPCTSTR pszTicker)
 {
@@ -1216,7 +1321,16 @@ PLUGINAPI int Init(void)
 
 		// Initialize on first call
 		g_oServer = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("Server"), _T("127.0.0.1"));
-		g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));  // Load API Key
+
+		// Read API key directly from the registry. MFC's GetProfileString was
+		// returning empty here in production even when the value existed, so
+		// we read it ourselves via RegQueryValueEx. We still attempt the MFC
+		// read as a fallback in case anyone wrote with the old code path.
+		if (!ReadApiKeyDirect(g_oApiKey) || g_oApiKey.IsEmpty())
+		{
+			g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));
+		}
+
 		g_oWebSocketUrl = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("WebSocketUrl"), _T("ws://127.0.0.1:8765"));  // Load WebSocket URL
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
 		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);
@@ -1695,9 +1809,12 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 		// reads from the same registry root that Configure/OnOK writes to.
 		theApp.EnsureRegistryRoot();
 
-		// Reload settings
+		// Reload settings (direct registry read for the API key — see Init)
 		g_oServer = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("Server"), _T("127.0.0.1"));
-		g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));  // Load API Key
+		if (!ReadApiKeyDirect(g_oApiKey) || g_oApiKey.IsEmpty())
+		{
+			g_oApiKey = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("ApiKey"), _T(""));
+		}
 		g_oWebSocketUrl = AfxGetApp()->GetProfileString(_T("OpenAlgo"), _T("WebSocketUrl"), _T("ws://127.0.0.1:8765"));  // Load WebSocket URL
 		g_nPortNumber = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("Port"), 5000);
 		g_nRefreshInterval = AfxGetApp()->GetProfileInt(_T("OpenAlgo"), _T("RefreshInterval"), 5);

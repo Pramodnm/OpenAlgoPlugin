@@ -44,4 +44,12 @@ CString GetAvailableSymbols(void);
 CString BuildOpenAlgoURL(const CString& server, int port, const CString& endpoint);
 // AddToOpenAlgoPortfolio is internal to Plugin.cpp, not needed here
 
+// Direct-registry API-key persistence (bypasses MFC's WriteProfileString,
+// which had been failing silently for this specific value).
+// Both functions target HKCU\Software\OpenAlgo\OpenAlgo\OpenAlgo\ApiKey,
+// the same path MFC would use, so anything written here is also visible to
+// any existing MFC read path.
+BOOL WriteApiKeyDirect(const CString& key);
+BOOL ReadApiKeyDirect(CString& outKey);
+
 #endif // OPENALGO_GLOBALS_H

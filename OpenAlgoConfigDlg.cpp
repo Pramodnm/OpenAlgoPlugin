@@ -134,7 +134,13 @@ void COpenAlgoConfigDlg::OnOK()
 	CWinApp* pApp = AfxGetApp();
 
 	BOOL bSrv  = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("Server"),        g_oServer)        : FALSE;
-	BOOL bKey  = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("ApiKey"),        g_oApiKey)        : FALSE;
+	// API key write is done DIRECTLY via the registry API. MFC's
+	// WriteProfileString was reliably saving everything else here but kept
+	// dropping just the ApiKey value -- presumably some quirk of the password
+	// edit DDX flow or MFC's registry helper. WriteApiKeyDirect uses
+	// RegSetValueEx against the same HKCU\Software\OpenAlgo\... path so the
+	// existing read path continues to see it.
+	BOOL bKey  = WriteApiKeyDirect(g_oApiKey);
 	BOOL bWs   = pApp ? pApp->WriteProfileString(_T("OpenAlgo"), _T("WebSocketUrl"),  g_oWebSocketUrl)  : FALSE;
 	BOOL bPort = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("Port"),          g_nPortNumber)    : FALSE;
 	BOOL bIv   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("RefreshInterval"), g_nRefreshInterval) : FALSE;
@@ -142,19 +148,27 @@ void COpenAlgoConfigDlg::OnOK()
 	BOOL bRt   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("EnableRealTimeCandles"), g_bRealTimeCandlesEnabled ? 1 : 0) : FALSE;
 	BOOL bBf   = pApp ? pApp->WriteProfileInt   (_T("OpenAlgo"), _T("BackfillIntervalMs"),    g_nBackfillIntervalMs)            : FALSE;
 
+	// Read it straight back to verify the value actually persisted. If a
+	// security policy or AV blocks the write we want to know immediately
+	// rather than silently losing the key again.
+	CString verifyKey;
+	BOOL bVerify = ReadApiKeyDirect(verifyKey) && (verifyKey == g_oApiKey);
+
 	CString log;
 	log.Format(
 		_T("OpenAlgo: OnOK saved ApiKey=%s Server=%s "
-		   "(srv=%d key=%d ws=%d port=%d iv=%d ts=%d rt=%d bf=%d)"),
+		   "(srv=%d key=%d ws=%d port=%d iv=%d ts=%d rt=%d bf=%d verify=%d)"),
 		(LPCTSTR)MaskKey(g_oApiKey), (LPCTSTR)g_oServer,
-		bSrv, bKey, bWs, bPort, bIv, bTs, bRt, bBf);
+		bSrv, bKey, bWs, bPort, bIv, bTs, bRt, bBf, bVerify);
 	OutputDebugString(log);
 
-	if (!bKey)
+	if (!bKey || !bVerify)
 	{
 		AfxMessageBox(
-			_T("Failed to write the OpenAlgo API key to the registry.\n")
-			_T("Check that AmiBroker has write access to HKCU\\Software\\OpenAlgo."),
+			_T("Failed to persist the OpenAlgo API key to the registry.\n")
+			_T("Check that AmiBroker has write access to ")
+			_T("HKCU\\Software\\OpenAlgo and that no security policy ")
+			_T("is blocking that location."),
 			MB_OK | MB_ICONERROR);
 		return;
 	}
