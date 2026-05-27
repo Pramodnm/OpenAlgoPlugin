@@ -1,101 +1,82 @@
-# OpenAlgo AmiBroker Plugin - Documentation Index
+# OpenAlgo AmiBroker Plugin Docs
 
-Welcome to the OpenAlgo AmiBroker Plugin documentation! This guide will help you find the right documentation for your needs.
+This folder documents the current OpenAlgo AmiBroker data plugin implementation.
 
-## 📚 Documentation Overview
+The plugin connects AmiBroker to a running OpenAlgo server. Historical bars are
+loaded through the OpenAlgo REST history API. Realtime quote updates and realtime
+candle construction use OpenAlgo WebSocket streams.
 
-### For End Users
+## Current Status
 
-| Document | Description | When to Read |
-|----------|-------------|--------------|
-| **[README.md](../README.md)** | Main plugin documentation, installation, and usage guide | Start here if you're a trader/user |
-| **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** | Common issues and solutions | When you encounter problems |
-| **[history.md](history.md)** | API endpoint documentation and examples | When working with the API directly |
+Working in this version:
 
-### For Developers
+- Historical 1-minute and daily data through `/api/v1/history`
+- Manual backfill from the AmiBroker plugin status menu
+- Automatic intraday refresh for the active chart
+- Realtime chart updates from WebSocket ticks
+- Realtime candle building from WebSocket LTP/trade frames
+- Realtime Quote Window updates from WebSocket quote/depth frames
+- WebSocket reconnect, authentication, ping/pong, and resubscription
+- Active-chart refresh after manual and periodic backfill
 
-| Document | Description | When to Read |
-|----------|-------------|--------------|
-| **[BUILD_GUIDE.md](BUILD_GUIDE.md)** | Complete build instructions from source | When setting up development environment |
-| **[TECHNICAL_DOCUMENTATION.md](TECHNICAL_DOCUMENTATION.md)** | Deep dive into implementation details | When understanding the codebase |
-| **[ARCHITECTURE.md](ARCHITECTURE.md)** | System design and component interactions | When modifying or extending the plugin |
+Known issue:
 
-## 🚀 Quick Start Paths
+- Time & Sales is not working reliably in this version. The code still attempts
+  to publish trade/bid/ask events through AmiBroker `RecentInfo`, but the
+  AmiBroker Time & Sales window remains empty in current testing. This is a
+  known limitation and will be fixed in a later version. No REST quote API
+  fallback should be added for Time & Sales; streaming must remain WebSocket
+  only.
 
-### I want to... Install and Use the Plugin
+## Documentation Map
 
-1. Read [README.md](../README.md) → Installation section
-2. Follow the 5-step installation guide
-3. Configure your connection
-4. If issues arise, check [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+Start here:
 
-### I want to... Build from Source
+- [User Guide](USER_GUIDE.md): installation, configuration, symbols, and daily use
+- [Architecture](ARCHITECTURE.md): system design and data flows
+- [Technical Documentation](TECHNICAL_DOCUMENTATION.md): implementation details
+- [Build Guide](BUILD_GUIDE.md): build, package, and deploy from source
+- [Troubleshooting](TROUBLESHOOTING.md): diagnostics for common issues
+- [Known Limitations](KNOWN_LIMITATIONS.md): current gaps and non-goals
+- [Release Notes](RELEASE_NOTES.md): current behavior and recent changes
 
-1. Read [BUILD_GUIDE.md](BUILD_GUIDE.md)
-2. Install prerequisites (Visual Studio, SDKs)
-3. Clone repository and open solution
-4. Build and test
+Reference material kept as-is:
 
-### I want to... Understand the Code
+- `docs/api`: OpenAlgo REST API reference
+- `docs/prompt`: OpenAlgo symbol, WebSocket, and indicator reference notes
 
-1. Start with [ARCHITECTURE.md](ARCHITECTURE.md) for high-level overview
-2. Read [TECHNICAL_DOCUMENTATION.md](TECHNICAL_DOCUMENTATION.md) for details
-3. Examine source code with this understanding
-4. Refer to [BUILD_GUIDE.md](BUILD_GUIDE.md) for development workflow
+## Supported AmiBroker Data Paths
 
-### I want to... Report a Bug or Contribute
+| AmiBroker feature | Current plugin source | Status |
+| --- | --- | --- |
+| Chart historical bars | REST `/api/v1/history` | Working |
+| Manual backfill | REST `/api/v1/history` | Working |
+| Realtime chart current candle | WebSocket mode 1 LTP/trade ticks | Working |
+| Realtime Quote Window | WebSocket mode 2 quote and mode 3 depth | Working |
+| Time & Sales | WebSocket mode 1/mode 3 mapped to `RecentInfo` events | Known issue |
 
-1. Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md) first
-2. Search existing issues on GitHub
-3. Read [CHANGELOG.md](CHANGELOG.md) to see if it's already fixed
-4. Follow contribution guidelines in [README.md](../README.md)
+## Important Runtime Rules
 
+- Streaming windows must use WebSocket data only. Do not use `/api/v1/quotes` as
+  a fallback for realtime quote or Time & Sales updates.
+- Historical backfill must use `/api/v1/history`.
+- The plugin supports `1m` and `D` history intervals in the current AmiBroker
+  integration.
+- Symbol names should normally be in `SYMBOL-EXCHANGE` format, for example
+  `RELIANCE-NSE`, `CRUDEOIL18JUN26FUT-MCX`, or `NIFTY28MAY26FUT-NFO`.
+- Data quality depends on the connected OpenAlgo broker feed. Verify data before
+  using it for decisions.
 
-## 📞 Getting Help
+## Configuration Summary
 
-### If Documentation Doesn't Help
+| Setting | Purpose | Default |
+| --- | --- | --- |
+| Server | OpenAlgo HTTP server host | `127.0.0.1` |
+| Port | OpenAlgo HTTP API port | `5000` |
+| API Key | OpenAlgo app API key | Required |
+| Backfill Refresh (sec) | Intraday history refresh cadence | `30` |
+| Time Shift (hours) | AmiBroker time adjustment | `0` |
+| WebSocket URL | OpenAlgo WebSocket endpoint | `ws://127.0.0.1:8765` |
 
-1. **Search GitHub Issues**: Check if someone else had the same problem
-2. **Community Forum**: Ask in OpenAlgo community
-3. **Discord**: Real-time chat support
-4. **GitHub Issue**: Create detailed bug report
-
-### Improving Documentation
-
-Found an error or want to improve docs?
-
-1. Fork repository
-2. Make changes to documentation
-3. Submit Pull Request
-4. We'll review and merge
-
-## 🔗 External Resources
-
-### OpenAlgo Platform
-- **Website**: https://openalgo.in
-- **Documentation**: https://docs.openalgo.in
-- **GitHub**: https://github.com/marketcalls/OpenAlgo
-
-### AmiBroker
-- **Website**: https://www.amibroker.com
-- **User Guide**: https://www.amibroker.com/guide/
-- **AFL Reference**: https://www.amibroker.com/guide/AFL.html
-
-### Development Tools
-- **Visual Studio**: https://visualstudio.microsoft.com/
-- **Git**: https://git-scm.com/
-- **Markdown Guide**: https://www.markdownguide.org/
-
-## 📜 License
-
-All documentation is licensed under **MIT License**, same as the plugin code.
-
-## 🙏 Acknowledgments
-
-Documentation created and maintained by:
-- OpenAlgo Community
-- Plugin contributors
-- Beta testers and users who provided feedback
-
----
-
+The connection/status heartbeat is internal and fixed at 30 seconds. The UI
+interval controls intraday backfill refresh, not WebSocket tick speed.

@@ -1,536 +1,147 @@
-# Build Guide - OpenAlgo AmiBroker Plugin
+# Build Guide
 
-Complete guide for building the OpenAlgo AmiBroker Plugin from source.
+This guide explains how to build `OpenAlgo.dll` from source.
 
-## Table of Contents
-1. [Prerequisites](#prerequisites)
-2. [Environment Setup](#environment-setup)
-3. [Building the Plugin](#building-the-plugin)
-4. [Testing](#testing)
-5. [Deployment](#deployment)
-6. [Troubleshooting Build Issues](#troubleshooting-build-issues)
-7. [Development Workflow](#development-workflow)
+## Requirements
 
-## Prerequisites
+- Windows 10 or Windows 11
+- Visual Studio 2022 Community or newer
+- Workload: Desktop development with C++
+- MFC component for the installed MSVC toolset
+- Windows 10/11 SDK
+- AmiBroker 64-bit for runtime testing
+- A running OpenAlgo server for live testing
 
-### Required Software
+The AmiBroker ADK headers are included in this repository under `ADK`.
 
-#### 1. Visual Studio
-- **Version**: Visual Studio 2019 or later (2022 recommended)
-- **Edition**: Community, Professional, or Enterprise
-- **Workloads Required**:
-  - Desktop development with C++
-  - Windows 10/11 SDK
-  - C++ MFC for latest build tools (x86 & x64)
+## Repository Layout
 
-#### 2. Windows SDK
-- **Version**: Windows 10 SDK (10.0.19041.0) or later
-- Automatically installed with Visual Studio C++ workload
-
-#### 3. Am iBroker SDK
-- **Location**: Included in `ADK` folder
-- **Files**: `Plugin.h`, `Plugin_Legacy.h`
-- No separate installation needed
-
-### Optional but Recommended
-
-- **Git**: For version control
-- **GitHub Desktop**: For easier Git operations
-- **VS Code**: For quick edits and documentation
-- **WinMerge** or **Beyond Compare**: For comparing code changes
-
-## Environment Setup
-
-### 1. Clone Repository
-
-```bash
-git clone https://github.com/marketcalls/OpenAlgo-Amibroker-Plugin.git
-cd OpenAlgo-Amibroker-Plugin/OpenAlgoPlugin
+```text
+OpenAlgoPlugin/
+  OpenAlgoPlugin.sln
+  OpenAlgoPlugin.vcxproj
+  Plugin.cpp
+  OpenAlgoConfigDlg.cpp
+  OpenAlgo.rc
+  ADK/
+  docs/
 ```
 
-### 2. Open Solution
+## Build From Command Line
 
-1. Launch Visual Studio
-2. Open `OpenAlgoPlugin.sln`
-3. Wait for solution to load and restore NuGet packages (if any)
+From the project directory:
 
-### 3. Verify Configuration
-
-Check these settings in Visual Studio:
-
-**Project Properties → General**
-- **Configuration Type**: Dynamic Library (.dll)
-- **Target Name**: OpenAlgo
-- **Platform Toolset**: Visual Studio 2019 (v142) or later
-- **Windows SDK Version**: 10.0 (latest installed)
-- **Character Set**: Use Unicode
-
-**Project Properties → C/C++ → General**
-- **Additional Include Directories**:
-  - `$(ProjectDir)`
-  - `$(ProjectDir)ADK\Include`
-
-**Project Properties → C/C++ → Precompiled Headers**
-- **Precompiled Header**: Use (/Yu)
-- **Precompiled Header File**: StdAfx.h
-
-**Project Properties → Linker → General**
-- **Additional Library Directories**: `$(ProjectDir)ADK\Lib`
-
-## Building the Plugin
-
-### Quick Build
-
-#### Debug Build (for development)
-```
-1. Select "Debug" configuration from toolbar
-2. Select "x64" platform
-3. Press F7 or Build → Build Solution
+```powershell
+& 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' OpenAlgoPlugin.vcxproj /p:Configuration=Release /p:Platform=x64 /m
 ```
 
-Output: `x64\Debug\OpenAlgo.dll`
+Expected output:
 
-#### Release Build (for distribution)
-```
-1. Select "Release" configuration from toolbar
-2. Select "x64" platform
-3. Press F7 or Build → Build Solution
-```
-
-Output: `x64\Release\OpenAlgo.dll`
-
-### Build Configurations
-
-#### Debug Configuration
-- **Purpose**: Development and debugging
-- **Optimizations**: Disabled (/Od)
-- **Debug Info**: Full (/Zi)
-- **Runtime Library**: Multi-threaded Debug DLL (/MDd)
-- **Size**: Larger (~2-3 MB)
-- **Performance**: Slower
-
-**Use Debug build when**:
-- Developing new features
-- Debugging issues
-- Testing changes
-- Learning codebase
-
-#### Release Configuration
-- **Purpose**: Production deployment
-- **Optimizations**: Maximum (/O2)
-- **Debug Info**: None or minimal
-- **Runtime Library**: Multi-threaded DLL (/MD)
-- **Size**: Smaller (~500 KB)
-- **Performance**: Optimal
-
-**Use Release build when**:
-- Creating distributable version
-- Performance testing
-- Final testing before release
-- Deploying to users
-
-### Build from Command Line
-
-#### Using Developer Command Prompt
-
-Open **Developer Command Prompt for VS 2019** (or later):
-
-```batch
-cd C:\Users\Admin1\source\repos\OpenAlgoPlugin\OpenAlgoPlugin
-msbuild OpenAlgoPlugin.sln /p:Configuration=Release /p:Platform=x64
+```text
+Release\OpenAlgo.dll
+Release\OpenAlgo.pdb
+Release\OpenAlgo.lib
 ```
 
-#### Using MSBuild directly
+Use `Release|x64` for normal AmiBroker testing.
 
-```batch
-"C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild\Current\Bin\MSBuild.exe" ^
-  OpenAlgoPlugin.sln ^
-  /p:Configuration=Release ^
-  /p:Platform=x64 ^
-  /m
+## Build From Visual Studio
+
+1. Open `OpenAlgoPlugin.sln`.
+2. Select `Release`.
+3. Select `x64`.
+4. Build the solution.
+5. Confirm `Release\OpenAlgo.dll` was produced.
+
+## Install Into AmiBroker
+
+1. Close AmiBroker.
+2. Copy `Release\OpenAlgo.dll` into the AmiBroker `Plugins` directory.
+3. Start AmiBroker.
+4. Create or open a database using the OpenAlgo data plugin.
+5. Configure server, port, API key, WebSocket URL, and backfill refresh.
+
+Typical AmiBroker plugin directory:
+
+```text
+C:\Program Files\AmiBroker\Plugins
 ```
 
-Parameters:
-- `/p:Configuration=Release` - Build in Release mode
-- `/p:Platform=x64` - Target 64-bit platform
-- `/m` - Use multiple CPU cores
+Use the path matching your local AmiBroker installation.
 
-### Build All Configurations
+## Configuration After Install
 
-To build both Debug and Release:
+Open:
 
-```batch
-msbuild OpenAlgoPlugin.sln /p:Configuration=Debug /p:Platform=x64
-msbuild OpenAlgoPlugin.sln /p:Configuration=Release /p:Platform=x64
+```text
+File -> Database Settings -> Configure
 ```
 
-## Testing
+Set:
 
-### Unit Testing
+- Server: OpenAlgo HTTP host, usually `127.0.0.1`
+- Port: usually `5000`
+- API Key: OpenAlgo app API key
+- Backfill Refresh (sec): default `30`
+- Time Shift: normally `0`
+- WebSocket URL: usually `ws://127.0.0.1:8765`
 
-Currently, unit tests are minimal. To add tests:
+Run both tests:
 
-1. Create a test project (Google Test or CTest)
-2. Add test cases for critical functions
-3. Run tests before committing changes
+- Test Connection
+- Test WebSocket
 
-### Integration Testing
+## Debug Build
 
-#### Test with AmiBroker
+Debug builds are useful with Visual Studio or DebugView.
 
-1. **Copy DLL to AmiBroker**:
-   ```batch
-   copy /Y "x64\Release\OpenAlgo.dll" "C:\Program Files\AmiBroker\Plugins\"
-   ```
-
-2. **Restart AmiBroker**
-
-3. **Open Configuration**:
-   - File → Database Settings → Configure
-   - Verify plugin appears in list
-
-4. **Test Connection**:
-   - Enter server details
-   - Click "Test Connection"
-   - Click "Test WebSocket"
-   - Both should show success
-
-5. **Test Historical Data**:
-   - Add a symbol (e.g., RELIANCE-NSE)
-   - Verify chart loads with data
-   - Check for any errors in AmiBroker log
-
-6. **Test Real-time Data**:
-   - Open quote window
-   - Verify LTP updates
-   - Check status LED color
-
-### Debugging in AmiBroker
-
-#### Attach Debugger
-
-1. Build Debug configuration
-2. Copy DLL to AmiBroker Plugins folder
-3. In Visual Studio: **Debug → Attach to Process**
-4. Select `Broker.exe` (AmiBroker)
-5. Click **Attach**
-6. Set breakpoints in plugin code
-7. Trigger plugin functionality in AmiBroker
-
-#### Debug Output
-
-Add debug logging:
-
-```cpp
-#ifdef _DEBUG
-    OutputDebugString(_T("Debug message here\n"));
-#endif
+```powershell
+& 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' OpenAlgoPlugin.vcxproj /p:Configuration=Debug /p:Platform=x64 /m
 ```
 
-View output in Visual Studio **Output** window or use [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview).
+Install the generated debug DLL into AmiBroker's plugin directory, then watch
+`OutputDebugString` messages using DebugView or the Visual Studio debugger.
 
-## Deployment
+## Runtime Test Checklist
 
-### Creating Release Package
+After installing a new build:
 
-#### Step 1: Build Release Version
+1. AmiBroker status area shows the plugin loaded.
+2. Configure dialog can read the saved API key.
+3. Test Connection succeeds.
+4. Test WebSocket succeeds.
+5. A symbol such as `RELIANCE-NSE` loads historical data.
+6. Realtime candles update during market hours.
+7. Realtime Quote Window updates from WebSocket.
+8. Manual 3-month backfill updates the active chart after completion.
+9. Time & Sales is expected to remain non-working in this version.
 
-```batch
-msbuild OpenAlgoPlugin.sln /p:Configuration=Release /p:Platform=x64
+## Common Build Issues
+
+### MFC headers not found
+
+Install the MFC component for your Visual Studio C++ toolset.
+
+### Wrong output location
+
+For `Release|x64`, the expected output is:
+
+```text
+Release\OpenAlgo.dll
 ```
 
-#### Step 2: Gather Files
+not `x64\Release`.
 
-Create deployment folder structure:
+### AmiBroker does not load the DLL
 
-```
-OpenAlgo-Plugin-v1.0.0/
-├── OpenAlgo.dll           (from x64\Release\)
-├── README.md              (user guide)
-├── LICENSE                (license file)
-└── docs/
-    ├── INSTALLATION.md
-    └── TROUBLESHOOTING.md
-```
+Check:
 
-#### Step 3: Create ZIP Archive
+- DLL architecture matches AmiBroker architecture, normally x64.
+- DLL is copied to the correct `Plugins` directory.
+- Required Visual C++ runtime is installed.
+- AmiBroker was restarted after copying the DLL.
 
-```batch
-cd x64\Release
-powershell Compress-Archive -Path OpenAlgo.dll,README.md,LICENSE -DestinationPath OpenAlgo-Plugin-v1.0.0.zip
-```
+### Old behavior still appears
 
-#### Step 4: Test Package
-
-1. Extract ZIP to clean folder
-2. Copy DLL to fresh AmiBroker installation
-3. Test all functionality
-4. Verify no errors or missing dependencies
-
-### Distributing Updates
-
-#### Version Numbering
-
-Follow [Semantic Versioning](https://semver.org/):
-- **MAJOR.MINOR.PATCH** (e.g., 1.2.3)
-- Increment MAJOR for breaking changes
-- Increment MINOR for new features
-- Increment PATCH for bug fixes
-
-#### Update Version in Code
-
-Edit `Plugin.cpp`:
-
-```cpp
-#define PLUGIN_VERSION 10003  // Version 1.0.3
-```
-
-Format: `MAJOR*10000 + MINOR*100 + PATCH`
-
-#### Create GitHub Release
-
-1. Tag version: `git tag v1.0.3`
-2. Push tag: `git push origin v1.0.3`
-3. Create Release on GitHub
-4. Upload ZIP file
-5. Write release notes (see CHANGELOG.md)
-
-## Troubleshooting Build Issues
-
-### Common Build Errors
-
-#### Error: "Cannot open include file 'afxwin.h'"
-
-**Cause**: MFC libraries not installed
-
-**Solution**:
-1. Open Visual Studio Installer
-2. Modify installation
-3. Check "C++ MFC for latest build tools"
-4. Click Modify and wait for installation
-
-#### Error: "LNK1120: unresolved externals"
-
-**Cause**: Missing library or incorrect linker settings
-
-**Solution**:
-1. Check **Linker → Input → Additional Dependencies**
-2. Verify all required libraries are listed:
-   - `ws2_32.lib` (WinSock)
-   - `wininet.lib` (WinInet)
-3. Clean and rebuild solution
-
-#### Error: "RC1015: cannot open include file 'afxres.h'"
-
-**Cause**: MFC resources not found
-
-**Solution**:
-1. Verify MFC is installed
-2. Check **Include Directories** contains SDK paths
-3. Rebuild solution
-
-#### Error: "Cannot find or open PDB file"
-
-**Cause**: Debug symbols not found (warning, not critical)
-
-**Solution**:
-- This is a warning, can be ignored
-- Or download symbols from Microsoft Symbol Server
-- Or disable symbol loading for system DLLs
-
-### Clean Build
-
-If build is corrupted:
-
-```batch
-# Delete all build artifacts
-rmdir /S /Q x64
-rmdir /S /Q .vs
-
-# Rebuild solution
-msbuild OpenAlgoPlugin.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64
-```
-
-In Visual Studio:
-- **Build → Clean Solution**
-- **Build → Rebuild Solution**
-
-## Development Workflow
-
-### Best Practices
-
-#### 1. Branch Strategy
-
-```bash
-# Create feature branch
-git checkout -b feature/new-feature
-
-# Make changes and commit
-git add .
-git commit -m "Add new feature"
-
-# Push to GitHub
-git push origin feature/new-feature
-
-# Create Pull Request on GitHub
-```
-
-#### 2. Before Committing
-
-- [ ] Build succeeds in both Debug and Release
-- [ ] No compiler warnings
-- [ ] Code is formatted consistently
-- [ ] Comments added for complex logic
-- [ ] Tested in AmiBroker
-- [ ] Documentation updated if needed
-
-#### 3. Commit Message Format
-
-Use clear, descriptive commit messages:
-
-```
-<type>: <subject>
-
-<body>
-
-<footer>
-```
-
-**Types**:
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation changes
-- `style`: Code style changes (formatting)
-- `refactor`: Code refactoring
-- `test`: Adding tests
-- `chore`: Build or tooling changes
-
-**Example**:
-```
-fix: Normalize timestamps for 1-minute bars
-
-- Added timestamp normalization in Plugin.cpp:708-717
-- Prevents freak candles during live updates
-- Matches approach used for daily bars
-
-Fixes #42
-```
-
-### Code Style Guidelines
-
-#### Naming Conventions
-
-```cpp
-// Classes: PascalCase
-class ConfigDialog { };
-
-// Functions: PascalCase
-void GetHistoricalData();
-
-// Variables: camelCase
-int quoteIndex = 0;
-
-// Global variables: g_ prefix
-CString g_oApiKey;
-
-// Constants: UPPER_CASE
-#define MAX_BUFFER_SIZE 4096
-
-// Member variables: m_ prefix
-CString m_sServerUrl;
-```
-
-#### Formatting
-
-- **Indentation**: Tabs (4 spaces)
-- **Braces**: K&R style (opening brace on same line)
-- **Line length**: Max 120 characters
-- **Comments**: Use // for single-line, /* */ for multi-line
-
-#### Example:
-
-```cpp
-// Good: Clear function with proper formatting
-void ProcessQuoteData(const CString& symbol, float price)
-{
-    if (price > 0)
-    {
-        // Update cache with new price
-        UpdateQuoteCache(symbol, price);
-    }
-    else
-    {
-        // Log error for invalid price
-        LogError(_T("Invalid price received"));
-    }
-}
-```
-
-### Adding New Features
-
-#### Template for New Feature
-
-1. **Plan**: Write design document
-2. **Branch**: Create feature branch
-3. **Implement**: Write code with comments
-4. **Test**: Test in Debug mode
-5. **Review**: Self-review code
-6. **Document**: Update documentation
-7. **Build**: Build Release version
-8. **Test**: Test Release build
-9. **Commit**: Commit with clear message
-10. **PR**: Create Pull Request
-
-## Continuous Integration (Future)
-
-### GitHub Actions (Planned)
-
-Create `.github/workflows/build.yml`:
-
-```yaml
-name: Build Plugin
-
-on: [push, pull_request]
-
-jobs:
-  build:
-    runs-on: windows-latest
-
-    steps:
-    - uses: actions/checkout@v2
-
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1
-
-    - name: Build
-      run: msbuild OpenAlgoPlugin.sln /p:Configuration=Release /p:Platform=x64
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v2
-      with:
-        name: OpenAlgo.dll
-        path: x64/Release/OpenAlgo.dll
-```
-
-## Resources
-
-### Documentation
-- [Visual Studio Docs](https://docs.microsoft.com/en-us/visualstudio/)
-- [MSBuild Reference](https://docs.microsoft.com/en-us/visualstudio/msbuild/)
-- [AmiBroker ADK](https://www.amibroker.com/guide/h_adk.html)
-- [MFC Documentation](https://docs.microsoft.com/en-us/cpp/mfc/)
-
-### Tools
-- [Visual Studio](https://visualstudio.microsoft.com/)
-- [Git](https://git-scm.com/)
-- [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview)
-- [Dependency Walker](http://www.dependencywalker.com/)
-
-### Community
-- GitHub Issues: Bug reports and feature requests
-- OpenAlgo Forum: General discussion
-- Discord: Real-time chat
-
----
-
-*Happy Building! If you encounter issues not covered here, please open an issue on GitHub.*
+Close AmiBroker before copying the DLL. Windows can keep the old plugin loaded
+while AmiBroker is running.
