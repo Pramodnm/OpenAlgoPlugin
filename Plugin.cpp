@@ -197,6 +197,7 @@ struct SymbolBarCache
 static CMap<CString, LPCTSTR, SymbolBarCache*, SymbolBarCache*> g_SymbolBarCache;
 static CRITICAL_SECTION g_SymbolBarCacheCS;
 static BOOL g_bSymbolBarCacheCSInitialized = FALSE;
+static CString g_LastRequestedTicker;
 
 // One queued HTTP fetch request. nForceDays > 0 overrides the default range
 // (used by the right-click "Backfill" menu so it works per-symbol asynchronously).
@@ -222,7 +223,7 @@ static volatile LONG g_bWsReaderShouldStop = 0;
 
 // Cache freshness windows. Stale entries trigger a background refresh but the
 // stale data is still served immediately so the chart never goes blank.
-static const DWORD ONEMIN_CACHE_LIFETIME_MS = 60000;     // refresh 1m every 60s
+static const DWORD ONEMIN_CACHE_LIFETIME_MS = 30000;     // refresh 1m every 30s
 static const DWORD DAILY_CACHE_LIFETIME_MS  = 3600000;   // refresh daily every 1h
 
 // Forward declarations
@@ -238,7 +239,7 @@ void StartWsReader(void);
 void StopWsReader(void);
 void SetupRetry(void);
 BOOL TestOpenAlgoConnection(void);
-int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int nSize, struct Quotation* pQuotes);
+int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int nSize, struct Quotation* pQuotes, int nForceDays);
 CString GetExchangeFromTicker(LPCTSTR pszTicker);
 CString GetIntervalString(int nPeriodicity);
 void ConvertUnixToPackedDate(time_t unixTime, union AmiDate* pAmiDate);
@@ -255,10 +256,10 @@ BOOL UnsubscribeFromSymbol(LPCTSTR pszTicker);
 BOOL ProcessWebSocketData(void);
 void GenerateWebSocketMaskKey(unsigned char* maskKey);
 void SubscribePendingSymbols(void);
+BOOL TryParseWebSocketTimestamp(const CString& rawTimestamp, time_t& outTimestamp);
 
 // Real-time candle building functions
 BOOL ProcessTick(const CString& symbol, const CString& exchange, float ltp, float lastTradeQty, time_t timestamp);
-time_t ParseISO8601Timestamp(const CString& isoTimestamp);
 BarBuilder* GetOrCreateBarBuilder(const CString& ticker);
 void CleanupBarBuilders(void);
 
@@ -766,7 +767,7 @@ void ConvertUnixToPackedDate(time_t unixTime, union AmiDate* pAmiDate)
 // - Any future sessions that exchanges may introduce
 //
 // Currently supports 1m and D (daily) intervals
-int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int nSize, struct Quotation* pQuotes)
+int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int nSize, struct Quotation* pQuotes, int nForceDays)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
@@ -789,7 +790,14 @@ int GetOpenAlgoHistory(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, int 
 		CTime startTime;
 		CTime endTime = todayDate;  // Request up to today for both Daily and Intraday
 
-		// Check if manual backfill was requested - override normal logic
+		// Forced menu backfill: fetch the full requested period directly.
+		if (nForceDays > 0)
+		{
+			startTime = todayDate - CTimeSpan((LONG)nForceDays, 0, 0, 0);
+			goto skip_gap_detection;
+		}
+
+		// Legacy deferred current-symbol request fallback.
 		if (g_bBackfillRequested && g_nBackfillPeriodicity == nPeriodicity && g_nBackfillDays > 0)
 		{
 			// Manual backfill - fetch full requested period regardless of existing data
@@ -950,11 +958,11 @@ skip_gap_detection:
 		CString startDate = startTime.Format(_T("%Y-%m-%d"));
 		CString endDate = endTime.Format(_T("%Y-%m-%d"));
 
-		// DEBUG: Log API request details
-		//CString apiDebugMsg;
-		//apiDebugMsg.Format(_T("API REQUEST - Symbol: %s, Exchange: %s, Interval: %s, Start: %s, End: %s"),
-		//	(LPCTSTR)symbol, (LPCTSTR)exchange, (LPCTSTR)interval, (LPCTSTR)startDate, (LPCTSTR)endDate);
-		//OutputDebugString(apiDebugMsg);
+		CString apiDebugMsg;
+		apiDebugMsg.Format(_T("OpenAlgo: history request symbol=%s exchange=%s interval=%s start=%s end=%s forceDays=%d"),
+			(LPCTSTR)symbol, (LPCTSTR)exchange, (LPCTSTR)interval,
+			(LPCTSTR)startDate, (LPCTSTR)endDate, nForceDays);
+		OutputDebugString(apiDebugMsg);
 
 		CString oPostData;
 		oPostData.Format(_T("{\"apikey\":\"%s\",\"symbol\":\"%s\",\"exchange\":\"%s\",\"interval\":\"%s\",\"start_date\":\"%s\",\"end_date\":\"%s\"}"),
@@ -1075,15 +1083,47 @@ skip_gap_detection:
 
 									CString candle = dataArray.Mid(candleStart, candleEnd - candleStart + 1);
 
-									// Parse timestamp
+									// Parse timestamp. OpenAlgo history may return either
+									// numeric epoch values or documented strings such as
+									// "2025-04-01 09:15:00+05:30".
 									int tsPos = candle.Find(_T("\"timestamp\":"));
 									if (tsPos >= 0)
 									{
 										tsPos += 12;
-										int tsEnd = candle.Find(_T(","), tsPos);
-										if (tsEnd < 0) tsEnd = candle.Find(_T("}"), tsPos);
-										CString tsStr = candle.Mid(tsPos, tsEnd - tsPos);
-										time_t timestamp = (time_t)_tstoi64(tsStr);
+										while (tsPos < candle.GetLength() && IsJsonWhitespace(candle[tsPos]))
+											tsPos++;
+
+										CString tsStr;
+										if (tsPos < candle.GetLength() && candle[tsPos] == _T('"'))
+										{
+											tsPos++;
+											int tsEnd = candle.Find(_T("\""), tsPos);
+											if (tsEnd < 0)
+											{
+												pos = candleEnd + 1;
+												continue;
+											}
+											tsStr = candle.Mid(tsPos, tsEnd - tsPos);
+										}
+										else
+										{
+											int tsEnd = candle.Find(_T(","), tsPos);
+											if (tsEnd < 0) tsEnd = candle.Find(_T("}"), tsPos);
+											if (tsEnd < 0)
+											{
+												pos = candleEnd + 1;
+												continue;
+											}
+											tsStr = candle.Mid(tsPos, tsEnd - tsPos);
+										}
+										tsStr.Trim();
+
+										time_t timestamp = 0;
+										if (!TryParseWebSocketTimestamp(tsStr, timestamp))
+										{
+											pos = candleEnd + 1;
+											continue;
+										}
 
 										// Convert to AmiBroker date
 									if (nPeriodicity == 86400) // Daily data
@@ -2030,6 +2070,12 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 				currentTicker = pn->pCurrentSINew->ShortName;
 			else if (pn->pCurrentSI != NULL && pn->pCurrentSI->ShortName[0] != 0)
 				currentTicker = pn->pCurrentSI->ShortName;
+			else if (g_bSymbolBarCacheCSInitialized)
+			{
+				EnterCriticalSection(&g_SymbolBarCacheCS);
+				currentTicker = g_LastRequestedTicker;
+				LeaveCriticalSection(&g_SymbolBarCacheCS);
+			}
 
 			// Helper macro -- declared before the switch because C++ doesn't
 			// allow initialized declarations between case labels.
@@ -2037,10 +2083,15 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 				do {                                                               \
 					if (!currentTicker.IsEmpty()) {                                \
 						QueueHttpFetch(currentTicker, (perVal), (daysVal));        \
+						CString log;                                                \
+						log.Format(_T("OpenAlgo: manual backfill queued current symbol %s, periodicity=%d, days=%d"), \
+							(LPCTSTR)currentTicker, (perVal), (daysVal));          \
+						OutputDebugString(log);                                     \
 					} else {                                                       \
 						g_nBackfillDays        = (daysVal);                        \
 						g_nBackfillPeriodicity = (perVal);                         \
 						g_bBackfillRequested   = TRUE;                             \
+						OutputDebugString(_T("OpenAlgo: manual backfill queued as deferred current-symbol request")); \
 					}                                                              \
 					::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0); \
 				} while (0)
@@ -2067,7 +2118,7 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 			// "Current Symbol" enqueues a per-symbol fetch directly via
 			// QueueHttpFetch with nForceDays, so the user-requested range is
 			// honored even if a routine refresh is mid-flight. "All Symbols"
-			// enumerates g_SubscribedSymbols and queues one fetch per entry.
+			// enumerates both chart-requested symbols and WS-subscribed symbols.
 			case 105: // 3 Months - Current Symbol
 				BACKFILL_CURRENT(90, 60);
 				break;
@@ -2089,7 +2140,22 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 				case 206: days = 9125; per = 86400; break;
 				}
 
-				// Walk every currently-subscribed symbol and queue a fetch.
+				CArray<CString, CString&> symbols;
+
+				// Chart-requested symbols live in the HTTP cache map, even if
+				// they are not currently present in the Realtime Quote window.
+				EnterCriticalSection(&g_SymbolBarCacheCS);
+				POSITION cpos = g_SymbolBarCache.GetStartPosition();
+				while (cpos != NULL)
+				{
+					CString sym;
+					SymbolBarCache* pCacheUnused = NULL;
+					g_SymbolBarCache.GetNextAssoc(cpos, sym, pCacheUnused);
+					symbols.Add(sym);
+				}
+				LeaveCriticalSection(&g_SymbolBarCacheCS);
+
+				// Add WS-subscribed symbols too; skip duplicates.
 				EnterCriticalSection(&g_WebSocketCriticalSection);
 				POSITION wpos = g_SubscribedSymbols.GetStartPosition();
 				while (wpos != NULL)
@@ -2097,9 +2163,27 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 					CString sym;
 					BOOL bSub;
 					g_SubscribedSymbols.GetNextAssoc(wpos, sym, bSub);
-					QueueHttpFetch(sym, per, days);
+					BOOL bExists = FALSE;
+					for (int i = 0; i < symbols.GetCount(); i++)
+					{
+						if (symbols[i] == sym)
+						{
+							bExists = TRUE;
+							break;
+						}
+					}
+					if (!bExists)
+						symbols.Add(sym);
 				}
 				LeaveCriticalSection(&g_WebSocketCriticalSection);
+
+				for (int i = 0; i < symbols.GetCount(); i++)
+					QueueHttpFetch(symbols[i], per, days);
+
+				CString log;
+				log.Format(_T("OpenAlgo: manual backfill queued %d symbol(s), periodicity=%d, days=%d"),
+					(int)symbols.GetCount(), per, days);
+				OutputDebugString(log);
 
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
@@ -2167,6 +2251,10 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 	CString ticker(pszTicker);
 	SymbolBarCache* pCache = GetOrCreateSymbolBarCache(ticker);
 	DWORD now = (DWORD)GetTickCount64();
+
+	EnterCriticalSection(&g_SymbolBarCacheCS);
+	g_LastRequestedTicker = ticker;
+	LeaveCriticalSection(&g_SymbolBarCacheCS);
 
 	// Honor manual backfill request from the right-click menu: invalidate the
 	// matching cache so the worker can refill it with the user-requested range.
@@ -3423,6 +3511,9 @@ BOOL ProcessWebSocketData(void)
 				// still preserving real LTQ whenever the feed provides it.
 				if (bLtpFrame && ltp > 0.0f && lastTradeQty <= 0.0f)
 					lastTradeQty = 1.0f;
+				BOOL bTradeFrame = (ltp > 0.0f &&
+				                    (bLtpFrame ||
+				                     (!bQuoteFrame && !bDepthFrame && lastTradeQty > 0.0f)));
 
 				// Throttled logging - only log every 100th tick to avoid performance impact
 				static int s_wsCounter = 0;
@@ -3512,15 +3603,15 @@ BOOL ProcessWebSocketData(void)
 						// LTP mode is the websocket trade stream. Do not suppress
 						// Time & Sales rows when consecutive trades print at the
 						// same price; AmiBroker still needs RI_STATUS_TRADE.
-						BOOL fireTrade  = (ltp > 0.0f &&
-						                   (bLtpFrame ||
-						                    (!bQuoteFrame && !bDepthFrame && lastTradeQty > 0.0f)));
+						BOOL fireTrade  = bTradeFrame;
 						BOOL fireNewBid = (bidPx > 0.0f && bidPx != prevBid);
 						BOOL fireNewAsk = (askPx > 0.0f && askPx != prevAsk);
 						if (fireTrade)  newStatus |= RI_STATUS_TRADE;
+						if (fireTrade && (bm & (RI_BID | RI_ASK))) newStatus |= RI_STATUS_BIDASK;
 						if (fireNewBid) newStatus |= RI_STATUS_NEW_BID | RI_STATUS_BIDASK;
 						if (fireNewAsk) newStatus |= RI_STATUS_NEW_ASK | RI_STATUS_BIDASK;
 						pRI->nStatus = newStatus;
+						BOOL bTimeSalesEvent = (fireTrade || fireNewBid || fireNewAsk);
 
 						// nDateUpdate / nTimeUpdate MUST be refreshed every tick
 						// and marked valid in nBitmap or AmiBroker's Quote Window
@@ -3538,20 +3629,27 @@ BOOL ProcessWebSocketData(void)
 						pRI->nBitmap = bm;
 						LeaveCriticalSection(&g_RecentInfoCS);
 
-						// Post on EVERY frame so AmiBroker re-reads the entry
-						// and the Quote Window keeps refreshing. Previous version
-						// only posted on ltp/bid/ask transitions, which let the
-						// Quote Window freeze any time a symbol's price held
-						// flat for a few seconds (which it routinely does for
-						// less-active NSE names and even MCX between trades).
-						// Time & Sales row type is still driven by the
-						// RI_STATUS_TRADE / NEW_BID / NEW_ASK bits computed
-						// above, so one event = one row, regardless of how
-						// many "value unchanged" frames are in between.
 						if (g_hAmiBrokerWnd != NULL)
 						{
-							PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE,
-							            0, (LPARAM)pRI);
+							if (bTimeSalesEvent)
+							{
+								// T&S consumes nStatus from the RecentInfo event.
+								// Deliver synchronously so a following quote/depth
+								// frame cannot clear TRADE/BIDASK before AmiBroker
+								// reads it from the queued message.
+								SendMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE,
+								            0, (LPARAM)pRI);
+
+								EnterCriticalSection(&g_RecentInfoCS);
+								pRI->nStatus = RI_STATUS_UPDATE | RI_STATUS_BARSREADY;
+								LeaveCriticalSection(&g_RecentInfoCS);
+							}
+							else
+							{
+								// Non-event frames still refresh the Realtime Quote
+								// Window/charts without creating duplicate T&S rows.
+								PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+							}
 						}
 
 						// Throttled diagnostic so we can confirm in DbgView
@@ -3574,33 +3672,43 @@ BOOL ProcessWebSocketData(void)
 						}
 					}
 
-					// Process tick for real-time candle building
-					if (g_bRealTimeCandlesEnabled && ltp > 0)
+					// Process only trade/LTP frames for real-time candle
+					// building. Quote/depth frames can repeat the last traded
+					// price with a newer book/update timestamp, which creates
+					// a false future candle until historical backfill corrects it.
+					if (g_bRealTimeCandlesEnabled && bTradeFrame)
 					{
 						// Default quantity to 1 if missing (quote mode doesn't include ltq)
 						if (lastTradeQty <= 0)
 							lastTradeQty = 1.0f;
 
-						// Use server timestamp if available (epoch ms), fall back to system time
+						// Use exchange/server tick timestamp for candle
+						// bucketing. Fall back to local time only if the feed
+						// omits timestamp or sends a clearly invalid value.
 						time_t tickTimestamp = time(NULL);
 						if (!timestamp.IsEmpty())
 						{
-							// Try parsing as epoch milliseconds first
-							__int64 tsValue = _ttoi64(timestamp);
-							if (tsValue > 1000000000000LL)  // Epoch milliseconds
+							time_t serverTime = 0;
+							if (TryParseWebSocketTimestamp(timestamp, serverTime))
 							{
-								time_t serverTime = (time_t)(tsValue / 1000);
-								// Validate server time is within reasonable range (not stale)
-								time_t diff = tickTimestamp - serverTime;
-								if (diff >= 0 && diff < 300)  // Within 5 minutes
+								time_t diff = serverTime - tickTimestamp;
+								if (diff >= -1800 && diff <= 300)
+								{
 									tickTimestamp = serverTime;
-							}
-							else if (tsValue > 1000000000LL)  // Epoch seconds
-							{
-								time_t serverTime = (time_t)tsValue;
-								time_t diff = tickTimestamp - serverTime;
-								if (diff >= 0 && diff < 300)
-									tickTimestamp = serverTime;
+								}
+								else
+								{
+									static DWORD s_lastRejectedTsLog = 0;
+									DWORD nowTick = (DWORD)GetTickCount64();
+									if ((nowTick - s_lastRejectedTsLog) > 60000)
+									{
+										s_lastRejectedTsLog = nowTick;
+										CString tsLog;
+										tsLog.Format(_T("OpenAlgo: rejected WS timestamp for candle alignment: %s diff=%ld sec"),
+											(LPCTSTR)timestamp, (long)diff);
+										OutputDebugString(tsLog);
+									}
+								}
 							}
 						}
 
@@ -3714,16 +3822,19 @@ void CleanupWebSocket(void)
 // Real-Time Candle Building Functions
 ///////////////////////////////
 
-// Parse ISO 8601 timestamp (e.g., "2025-05-28T10:30:45.123Z")
-time_t ParseISO8601Timestamp(const CString& isoTimestamp)
+// Parse websocket timestamps used by OpenAlgo:
+// - epoch milliseconds / seconds
+// - ISO-8601 UTC:        2025-05-28T10:30:45.123Z
+// - ISO-8601 with offset 2025-05-28T16:00:45+05:30
+// - local exchange time: 2025-05-28 16:00:45
+BOOL TryParseWebSocketTimestamp(const CString& rawTimestamp, time_t& outTimestamp)
 {
-	if (isoTimestamp.IsEmpty())
-		return time(NULL);
+	outTimestamp = 0;
 
-	// Check if it's a Unix timestamp (all digits, possibly with whitespace)
-	// Example: "1761157800000" (milliseconds since epoch)
-	CString trimmed = isoTimestamp;
+	CString trimmed = rawTimestamp;
 	trimmed.Trim();
+	if (trimmed.IsEmpty())
+		return FALSE;
 
 	BOOL isNumeric = TRUE;
 	for (int i = 0; i < trimmed.GetLength(); i++)
@@ -3737,42 +3848,76 @@ time_t ParseISO8601Timestamp(const CString& isoTimestamp)
 
 	if (isNumeric)
 	{
-		// Parse as Unix timestamp in MILLISECONDS
-		__int64 milliseconds = _tstoi64(trimmed);
+		__int64 value = _tstoi64(trimmed);
+		if (value > 1000000000000LL)       // epoch milliseconds
+			outTimestamp = (time_t)(value / 1000);
+		else if (value > 1000000000LL)     // epoch seconds
+			outTimestamp = (time_t)value;
+		else
+			return FALSE;
 
-		// Convert milliseconds to seconds
-		time_t timestamp = (time_t)(milliseconds / 1000);
-
-		return timestamp;
+		return TRUE;
 	}
 
-	// Otherwise, try to parse as ISO 8601: YYYY-MM-DDTHH:MM:SS.sssZ
-	struct tm timeinfo = { 0 };
-	int year, month, day, hour, minute, second;
-
-	int count = _stscanf_s(isoTimestamp, _T("%d-%d-%dT%d:%d:%d"),
+	int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+	int count = _stscanf_s(trimmed, _T("%d-%d-%dT%d:%d:%d"),
 		&year, &month, &day, &hour, &minute, &second);
-
-	if (count == 6)
+	if (count != 6)
 	{
-		timeinfo.tm_year = year - 1900;
-		timeinfo.tm_mon = month - 1;
-		timeinfo.tm_mday = day;
-		timeinfo.tm_hour = hour;
-		timeinfo.tm_min = minute;
-		timeinfo.tm_sec = second;
-		timeinfo.tm_isdst = -1;
+		count = _stscanf_s(trimmed, _T("%d-%d-%d %d:%d:%d"),
+			&year, &month, &day, &hour, &minute, &second);
+	}
+	if (count != 6)
+		return FALSE;
 
-		// Convert to Unix timestamp
-		time_t timestamp = mktime(&timeinfo);
+	struct tm timeinfo = {0};
+	timeinfo.tm_year = year - 1900;
+	timeinfo.tm_mon = month - 1;
+	timeinfo.tm_mday = day;
+	timeinfo.tm_hour = hour;
+	timeinfo.tm_min = minute;
+	timeinfo.tm_sec = second;
+	timeinfo.tm_isdst = -1;
 
-		// Note: This assumes local time. For UTC, we'd need _mkgmtime or adjust for timezone
-		// For simplicity, using local time which matches server time in most cases
-		return timestamp;
+	int tzPos = -1;
+	for (int i = 10; i < trimmed.GetLength(); i++)
+	{
+		if (trimmed[i] == _T('Z') || trimmed[i] == _T('z') ||
+		    trimmed[i] == _T('+') || trimmed[i] == _T('-'))
+		{
+			tzPos = i;
+			break;
+		}
 	}
 
-	// If all parsing fails, return current time as fallback
-	return time(NULL);
+	if (tzPos >= 0)
+	{
+		if (trimmed[tzPos] == _T('Z') || trimmed[tzPos] == _T('z'))
+		{
+			outTimestamp = _mkgmtime(&timeinfo);
+			return outTimestamp != (time_t)-1;
+		}
+
+		int offHour = 0;
+		int offMinute = 0;
+		CString offsetPart = trimmed.Mid(tzPos + 1);
+		if (_stscanf_s(offsetPart, _T("%d:%d"), &offHour, &offMinute) < 1)
+			return FALSE;
+
+		int offsetSeconds = (offHour * 3600) + (offMinute * 60);
+		if (trimmed[tzPos] == _T('-'))
+			offsetSeconds = -offsetSeconds;
+
+		time_t utcAssumed = _mkgmtime(&timeinfo);
+		if (utcAssumed == (time_t)-1)
+			return FALSE;
+
+		outTimestamp = utcAssumed - offsetSeconds;
+		return TRUE;
+	}
+
+	outTimestamp = mktime(&timeinfo);
+	return outTimestamp != (time_t)-1;
 }
 
 // Get or create BarBuilder for a ticker
@@ -3969,9 +4114,9 @@ void QueueHttpFetch(const CString& ticker, int nPeriodicity, int nForceDays)
 		HttpWorkItem& existing = g_HttpWorkQueue.GetNext(pos);
 		if (existing.ticker == ticker && existing.nPeriodicity == nPeriodicity)
 		{
-			// If the new request specifies a force range and the queued one
-			// doesn't, upgrade the queued one in place so we still honor it.
-			if (nForceDays > 0 && existing.nForceDays <= 0)
+			// If the new request specifies a force range, upgrade the queued
+			// job so a later/larger manual backfill is honored.
+			if (nForceDays > existing.nForceDays)
 				existing.nForceDays = nForceDays;
 			bAlreadyQueued = TRUE;
 			break;
@@ -3980,6 +4125,11 @@ void QueueHttpFetch(const CString& ticker, int nPeriodicity, int nForceDays)
 	if (!bAlreadyQueued)
 		g_HttpWorkQueue.AddTail(item);
 	LeaveCriticalSection(&g_HttpWorkQueueCS);
+
+	CString qlog;
+	qlog.Format(_T("OpenAlgo: queued history fetch ticker=%s periodicity=%d forceDays=%d alreadyQueued=%d"),
+		(LPCTSTR)ticker, nPeriodicity, nForceDays, bAlreadyQueued);
+	OutputDebugString(qlog);
 
 	if (g_hHttpWorkEvent)
 		SetEvent(g_hHttpWorkEvent);
@@ -4018,15 +4168,6 @@ UINT __cdecl HttpWorkerThreadProc(LPVOID /*pArg*/)
 			if (!bHaveWork)
 				break;
 
-			// If the work item carries a forced range, set the globals that
-			// GetOpenAlgoHistory consumes. Single-threaded worker, so no race.
-			if (item.nForceDays > 0)
-			{
-				g_nBackfillDays = item.nForceDays;
-				g_nBackfillPeriodicity = item.nPeriodicity;
-				g_bBackfillRequested = TRUE;
-			}
-
 			struct Quotation* tmpBars =
 				(struct Quotation*)malloc(TMP_SIZE * sizeof(struct Quotation));
 			if (tmpBars == NULL)
@@ -4042,7 +4183,8 @@ UINT __cdecl HttpWorkerThreadProc(LPVOID /*pArg*/)
 			memset(tmpBars, 0, TMP_SIZE * sizeof(struct Quotation));
 
 			int nResult = GetOpenAlgoHistory(item.ticker, item.nPeriodicity,
-			                                 -1, TMP_SIZE, tmpBars);
+			                                 -1, TMP_SIZE, tmpBars,
+			                                 item.nForceDays);
 
 			SymbolBarCache* pCache = GetOrCreateSymbolBarCache(item.ticker);
 			DWORD now = (DWORD)GetTickCount64();
