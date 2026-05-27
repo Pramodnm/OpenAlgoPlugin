@@ -93,6 +93,16 @@ struct QuoteCache {
 
 static CMap<CString, LPCTSTR, QuoteCache, QuoteCache&> g_QuoteCache;
 
+// Per-symbol persistent RecentInfo for the Realtime Quote Window + Time & Sales.
+// AmiBroker may hold the pointer returned by GetRecentInfo across calls, and
+// reads it on every quote-window refresh. Backing it with a per-symbol
+// heap-allocated struct (rather than a single static) keeps every pointer
+// stable for the lifetime of the plugin, and lets the WS reader thread
+// update fields in-place while the UI thread is reading.
+static CMap<CString, LPCTSTR, struct RecentInfo*, struct RecentInfo*> g_RecentInfoMap;
+static CRITICAL_SECTION g_RecentInfoCS;
+static BOOL g_bRecentInfoCSInit = FALSE;
+
 typedef CArray< struct Quotation, struct Quotation > CQuoteArray;
 
 //////////////////////////////////////////////////////////
@@ -1482,6 +1492,11 @@ PLUGINAPI int Init(void)
 		InitializeCriticalSection(&g_HttpWorkQueueCS);
 		g_bHttpWorkQueueCSInitialized = TRUE;
 
+		// Per-symbol RecentInfo map for the Realtime Quote Window
+		InitializeCriticalSection(&g_RecentInfoCS);
+		g_bRecentInfoCSInit = TRUE;
+		g_RecentInfoMap.InitHashTable(127);
+
 		StartHttpWorker();
 
 		// Launch the WS reader thread before (or alongside) the initial
@@ -1562,6 +1577,25 @@ PLUGINAPI int Release(void)
 
 		DeleteCriticalSection(&g_HttpWorkQueueCS);
 		g_bHttpWorkQueueCSInitialized = FALSE;
+	}
+
+	// Free per-symbol RecentInfo entries
+	if (g_bRecentInfoCSInit)
+	{
+		EnterCriticalSection(&g_RecentInfoCS);
+		POSITION ripos = g_RecentInfoMap.GetStartPosition();
+		while (ripos != NULL)
+		{
+			CString tk;
+			struct RecentInfo* pInfo = NULL;
+			g_RecentInfoMap.GetNextAssoc(ripos, tk, pInfo);
+			if (pInfo) delete pInfo;
+		}
+		g_RecentInfoMap.RemoveAll();
+		LeaveCriticalSection(&g_RecentInfoCS);
+
+		DeleteCriticalSection(&g_RecentInfoCS);
+		g_bRecentInfoCSInit = FALSE;
 	}
 
 	if (g_bHttpCacheCriticalSectionInitialized)
@@ -2007,6 +2041,32 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 			// Destroy menus after use (submenus are destroyed automatically with parent)
 			DestroyMenu(hMenu);
 
+			// Resolve the "current symbol" once for all the Current-Symbol menu
+			// cases below. PluginNotification.pCurrentSINew->ShortName is the
+			// ticker AmiBroker is currently displaying; this lets us enqueue a
+			// per-symbol HTTP fetch directly instead of relying on the next
+			// generic WSUM hop (which would race a routine fetch in progress
+			// and could be dropped by the in-progress flag).
+			CString currentTicker;
+			if (pn->pCurrentSINew != NULL && pn->pCurrentSINew->ShortName[0] != 0)
+				currentTicker = pn->pCurrentSINew->ShortName;
+			else if (pn->pCurrentSI != NULL && pn->pCurrentSI->ShortName[0] != 0)
+				currentTicker = pn->pCurrentSI->ShortName;
+
+			// Helper macro -- declared before the switch because C++ doesn't
+			// allow initialized declarations between case labels.
+			#define BACKFILL_CURRENT(daysVal, perVal)                              \
+				do {                                                               \
+					if (!currentTicker.IsEmpty()) {                                \
+						QueueHttpFetch(currentTicker, (perVal), (daysVal));        \
+					} else {                                                       \
+						g_nBackfillDays        = (daysVal);                        \
+						g_nBackfillPeriodicity = (perVal);                         \
+						g_bBackfillRequested   = TRUE;                             \
+					}                                                              \
+					::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0); \
+				} while (0)
+
 			switch (nCmd)
 			{
 			case 1: // Connect
@@ -2026,15 +2086,12 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 				break;
 
 			// 1-Minute backfill options.
-			// "Current Symbol" relies on the next GetQuotesEx call from AmiBroker
-			// (which has the actual ticker) to enqueue the per-symbol fetch via
-			// the cache-invalidate path. "All Symbols" enumerates the subscribed
-			// symbols and queues a fetch for each with the requested range.
+			// "Current Symbol" enqueues a per-symbol fetch directly via
+			// QueueHttpFetch with nForceDays, so the user-requested range is
+			// honored even if a routine refresh is mid-flight. "All Symbols"
+			// enumerates g_SubscribedSymbols and queues one fetch per entry.
 			case 105: // 3 Months - Current Symbol
-				g_nBackfillDays = 90;
-				g_nBackfillPeriodicity = 60;
-				g_bBackfillRequested = TRUE;
-				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+				BACKFILL_CURRENT(90, 60);
 				break;
 			case 106: // 3 Months - All Symbols
 			case 108: // 6 Months - All Symbols
@@ -2069,38 +2126,12 @@ PLUGINAPI int Notify(struct PluginNotification* pn)
 				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 				break;
 			}
-			case 107: // 6 Months - Current Symbol
-				g_nBackfillDays = 180;
-				g_nBackfillPeriodicity = 60;
-				g_bBackfillRequested = TRUE;
-				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
-				break;
-			case 109: // 1 Year - Current Symbol
-				g_nBackfillDays = 365;
-				g_nBackfillPeriodicity = 60;
-				g_bBackfillRequested = TRUE;
-				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
-				break;
-
-			// Daily backfill (Current Symbol variants)
-			case 201: // 5 Years - Current Symbol
-				g_nBackfillDays = 1825;
-				g_nBackfillPeriodicity = 86400;
-				g_bBackfillRequested = TRUE;
-				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
-				break;
-			case 203: // 10 Years - Current Symbol
-				g_nBackfillDays = 3650;
-				g_nBackfillPeriodicity = 86400;
-				g_bBackfillRequested = TRUE;
-				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
-				break;
-			case 205: // 25 Years - Current Symbol
-				g_nBackfillDays = 9125;
-				g_nBackfillPeriodicity = 86400;
-				g_bBackfillRequested = TRUE;
-				::PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
-				break;
+			case 107: BACKFILL_CURRENT(180,  60);    break;  // 6 Months
+			case 109: BACKFILL_CURRENT(365,  60);    break;  // 1 Year
+			case 201: BACKFILL_CURRENT(1825, 86400); break;  // Daily 5 Years
+			case 203: BACKFILL_CURRENT(3650, 86400); break;  // Daily 10 Years
+			case 205: BACKFILL_CURRENT(9125, 86400); break;  // Daily 25 Years
+			#undef BACKFILL_CURRENT
 			}
 
 			// Update status display
@@ -2352,121 +2383,66 @@ PLUGINAPI int GetQuotesEx(LPCTSTR pszTicker, int nPeriodicity, int nLastValid, i
 }
 
 
-// GetRecentInfo is ONLY for Real-time Quote Window display
-// This function provides Level 1 quotes for the quote window
-// It should NEVER be used for chart data or OHLC bars
+// Get-or-create a persistent RecentInfo struct for a ticker. The pointer
+// stays valid for the lifetime of the plugin, so it's safe to (a) return to
+// AmiBroker from GetRecentInfo and (b) pass as LPARAM in a posted
+// WM_USER_STREAMING_UPDATE.
+struct RecentInfo* GetOrCreateRecentInfoEntry(const CString& ticker)
+{
+	struct RecentInfo* pInfo = NULL;
+	EnterCriticalSection(&g_RecentInfoCS);
+	if (!g_RecentInfoMap.Lookup(ticker, pInfo) || pInfo == NULL)
+	{
+		pInfo = new struct RecentInfo();
+		memset(pInfo, 0, sizeof(struct RecentInfo));
+		pInfo->nStructSize = sizeof(struct RecentInfo);
+
+		// Pre-populate name + exchange so the Quote Window column always shows
+		// the right ticker even before the first frame arrives.
+		CStringA tickerA(ticker);
+		strncpy_s(pInfo->Name, sizeof(pInfo->Name), tickerA, _TRUNCATE);
+		CStringA exchA(GetExchangeFromTicker(ticker));
+		strncpy_s(pInfo->Exchange, sizeof(pInfo->Exchange), exchA, _TRUNCATE);
+
+		g_RecentInfoMap.SetAt(ticker, pInfo);
+	}
+	LeaveCriticalSection(&g_RecentInfoCS);
+	return pInfo;
+}
+
+// GetRecentInfo is ONLY for the Realtime Quote Window + Time & Sales.
+// WS-only -- no HTTP fallback. The broker's /api/v1/quotes endpoint is
+// severely rate-limited and was driving the empty rows for slower symbols.
+// Mode 1 + Mode 2 WS frames now populate a persistent per-symbol RecentInfo
+// entry on the worker thread; this function just returns the pointer to it.
 PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
-	// Check if we're connected and have an API key
 	if (g_nStatus != STATUS_CONNECTED || g_oApiKey.IsEmpty())
 		return NULL;
 
-	static struct RecentInfo ri;
-	memset(&ri, 0, sizeof(ri));
-	ri.nStructSize = sizeof(struct RecentInfo);
-
 	CString ticker(pszTicker);
-	
-	// Initialize WebSocket connection if needed (but don't block if connection is in progress)
-	// Also add a delay between connection attempts to avoid hammering the server
-	DWORD dwNow = (DWORD)GetTickCount64();
-	if (!g_bWebSocketConnected && !g_bWebSocketConnecting && 
-		(dwNow - g_dwLastConnectionAttempt) > 10000) // Wait 10 seconds between attempts
-	{
-		g_dwLastConnectionAttempt = dwNow;
-		InitializeWebSocket();
-	}
 
-	// Critical section should already be initialized in Init()
-
-	// Check if this symbol is already subscribed via WebSocket
-	BOOL bSubscribed = FALSE;
+	// Ensure this symbol is on the WS subscription list. We set it in the map
+	// EVEN IF the send fails -- the WS reader thread's reconnect path walks
+	// g_SubscribedSymbols and re-issues subscribe for every entry, so missed
+	// initial sends are self-healing on the next reconnect.
 	EnterCriticalSection(&g_WebSocketCriticalSection);
-	
-	if (!g_SubscribedSymbols.Lookup(ticker, bSubscribed))
+	BOOL bAlready = FALSE;
+	if (!g_SubscribedSymbols.Lookup(ticker, bAlready))
 	{
-		// Symbol not subscribed yet, subscribe to it
+		g_SubscribedSymbols.SetAt(ticker, TRUE);
 		if (g_bWebSocketConnected)
-		{
-			// Give authentication a moment to complete if it's still processing
-			if (!g_bWebSocketAuthenticated)
-			{
-				Sleep(100);
-			}
-			
-			// Try to subscribe - authentication will be handled automatically
-			if (SubscribeToSymbol(pszTicker))
-			{
-				g_SubscribedSymbols.SetAt(ticker, TRUE);
-				
-				// Mark as authenticated since we successfully sent a subscribe request
-				// (this handles cases where auth response parsing failed but server accepted subscription)
-				if (!g_bWebSocketAuthenticated)
-				{
-					g_bWebSocketAuthenticated = TRUE;
-				}
-			}
-		}
+			SubscribeToSymbol(pszTicker);
 	}
-	
 	LeaveCriticalSection(&g_WebSocketCriticalSection);
 
-	// Do NOT call ProcessWebSocketData() here. The dedicated WsReaderThread is
-	// the only socket reader; if GetRecentInfo also called recv() concurrently
-	// from the UI thread, two readers could split a frame between them and
-	// corrupt the parser. The thread's drain populates g_QuoteCache for us.
-
-	// Check cache for WebSocket data first
-	QuoteCache cachedQuote;
-	BOOL bCached = FALSE;
-
-	if (g_QuoteCache.Lookup(ticker, cachedQuote))
-	{
-		// Use cached data if it's less than 5 seconds old
-		DWORD dwNow = (DWORD)GetTickCount64();
-		if ((dwNow - cachedQuote.lastUpdate) < 5000)
-		{
-			bCached = TRUE;
-		}
-	}
-
-	// Fallback to HTTP API if WebSocket data not available
-	if (!bCached)
-	{
-		if (!GetOpenAlgoQuote(pszTicker, cachedQuote))
-			return NULL;
-
-		// Store in cache
-		g_QuoteCache.SetAt(ticker, cachedQuote);
-	}
-
-	// Fill RecentInfo structure
-	_tcsncpy_s(ri.Name, sizeof(ri.Name) / sizeof(TCHAR), pszTicker, _TRUNCATE);
-	_tcsncpy_s(ri.Exchange, sizeof(ri.Exchange) / sizeof(TCHAR), cachedQuote.exchange, _TRUNCATE);
-
-	ri.nStatus = RI_STATUS_UPDATE | RI_STATUS_TRADE | RI_STATUS_BARSREADY;
-	ri.nBitmap = RI_LAST | RI_OPEN | RI_HIGHLOW | RI_TRADEVOL | RI_OPENINT;
-
-	ri.fLast = cachedQuote.ltp;
-	ri.fOpen = cachedQuote.open;
-	ri.fHigh = cachedQuote.high;
-	ri.fLow = cachedQuote.low;
-	ri.fPrev = cachedQuote.close;
-	ri.fChange = cachedQuote.ltp - cachedQuote.close;
-	ri.fTradeVol = cachedQuote.volume;
-	ri.fTotalVol = cachedQuote.volume;
-	ri.fOpenInt = cachedQuote.oi;
-
-	// Set update times
-	CTime now = CTime::GetCurrentTime();
-	ri.nDateUpdate = now.GetYear() * 10000 + now.GetMonth() * 100 + now.GetDay();
-	ri.nTimeUpdate = now.GetHour() * 10000 + now.GetMinute() * 100 + now.GetSecond();
-	ri.nDateChange = ri.nDateUpdate;
-	ri.nTimeChange = ri.nTimeUpdate;
-
-	return &ri;
+	// Return the persistent per-symbol RecentInfo. It starts zeroed (nBitmap=0
+	// means "no field is valid yet"), so the Quote Window row shows empty
+	// cells until the first WS Mode 2 frame lands and the worker thread fills
+	// it in. The pointer itself is stable across all calls.
+	return GetOrCreateRecentInfoEntry(ticker);
 }
 
 ///////////////////////////////
@@ -3495,6 +3471,61 @@ BOOL ProcessWebSocketData(void)
 					quote.lastUpdate = (DWORD)GetTickCount64();
 
 					g_QuoteCache.SetAt(ticker, quote);
+
+					// Update the persistent RecentInfo for the Realtime Quote
+					// Window + Time & Sales (replaces old static-struct path).
+					struct RecentInfo* pRI = GetOrCreateRecentInfoEntry(ticker);
+					if (pRI)
+					{
+						EnterCriticalSection(&g_RecentInfoCS);
+						pRI->nStatus = RI_STATUS_UPDATE | RI_STATUS_TRADE | RI_STATUS_BARSREADY;
+						// nBitmap accumulates over Mode 1 + Mode 2 frames so each
+						// field stays "valid" once we've ever seen it for the symbol.
+						int bm = pRI->nBitmap;
+						if (ltp    > 0.0f) { pRI->fLast = ltp;       bm |= RI_LAST; }
+						if (open   > 0.0f) { pRI->fOpen = open;      bm |= RI_OPEN; }
+						if (high   > 0.0f) { pRI->fHigh = high;      bm |= RI_HIGHLOW; }
+						if (low    > 0.0f) { pRI->fLow  = low;       bm |= RI_HIGHLOW; }
+						if (close  > 0.0f)
+						{
+							pRI->fPrev = close;
+							if (ltp > 0.0f) pRI->fChange = ltp - close;
+							bm |= RI_PREVCHANGE;
+						}
+						if (volume > 0.0f)
+						{
+							pRI->iTotalVol = (int)volume;   // legacy 32-bit
+							pRI->fTotalVol = volume;        // 5.27+ float
+							bm |= RI_TOTALVOL;
+						}
+						if (lastTradeQty > 0.0f)
+						{
+							pRI->iTradeVol = (int)lastTradeQty;
+							pRI->fTradeVol = lastTradeQty;
+							bm |= RI_TRADEVOL;
+						}
+						if (oi     > 0.0f) { pRI->fOpenInt = oi;     bm |= RI_OPENINT; }
+						pRI->nBitmap = bm;
+
+						// nDateUpdate / nTimeUpdate MUST be refreshed every tick
+						// or AmiBroker's Quote Window won't update.
+						CTime nowT = CTime::GetCurrentTime();
+						pRI->nDateUpdate = nowT.GetYear() * 10000 + nowT.GetMonth() * 100 + nowT.GetDay();
+						pRI->nTimeUpdate = nowT.GetHour() * 10000 + nowT.GetMinute() * 100 + nowT.GetSecond();
+						pRI->nDateChange = pRI->nDateUpdate;
+						pRI->nTimeChange = pRI->nTimeUpdate;
+						LeaveCriticalSection(&g_RecentInfoCS);
+
+						// Post WM_USER_STREAMING_UPDATE with LPARAM = pRecentInfo
+						// so AmiBroker records the trade in Time & Sales. Pointer
+						// is owned by the persistent map -- safe across the async
+						// message hop.
+						if (g_hAmiBrokerWnd != NULL && ltp > 0.0f)
+						{
+							PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE,
+							            0, (LPARAM)pRI);
+						}
+					}
 
 					// Process tick for real-time candle building
 					if (g_bRealTimeCandlesEnabled && ltp > 0)
