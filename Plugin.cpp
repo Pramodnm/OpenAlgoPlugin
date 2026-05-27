@@ -2566,6 +2566,108 @@ void ForceAmiBrokerRefreshAll(void)
 #endif
 }
 
+BOOL GetActiveAmiBrokerSymbol(CString& activeTicker)
+{
+	activeTicker.Empty();
+
+#ifndef _AFX_NO_OLE_SUPPORT
+	HRESULT hrCo = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	BOOL bCoUninit = SUCCEEDED(hrCo);
+	if (FAILED(hrCo) && hrCo != RPC_E_CHANGED_MODE)
+		return FALSE;
+
+	BOOL bOK = FALSE;
+	CLSID clsid;
+	HRESULT hr = CLSIDFromProgID(L"Broker.Application", &clsid);
+	if (SUCCEEDED(hr))
+	{
+		IUnknown* pUnknown = NULL;
+		IDispatch* pApp = NULL;
+		hr = GetActiveObject(clsid, NULL, &pUnknown);
+		if (SUCCEEDED(hr) && pUnknown != NULL)
+		{
+			hr = pUnknown->QueryInterface(IID_IDispatch, (void**)&pApp);
+			pUnknown->Release();
+		}
+
+		if (SUCCEEDED(hr) && pApp != NULL)
+		{
+			OLECHAR activeDocName[] = L"ActiveDocument";
+			LPOLESTR pActiveDocName = activeDocName;
+			DISPID dispidActiveDoc = DISPID_UNKNOWN;
+			hr = pApp->GetIDsOfNames(IID_NULL, &pActiveDocName, 1,
+			                         LOCALE_USER_DEFAULT, &dispidActiveDoc);
+			if (SUCCEEDED(hr))
+			{
+				DISPPARAMS noArgs = { NULL, NULL, 0, 0 };
+				VARIANT docVar;
+				VariantInit(&docVar);
+				hr = pApp->Invoke(dispidActiveDoc, IID_NULL, LOCALE_USER_DEFAULT,
+				                  DISPATCH_PROPERTYGET, &noArgs, &docVar, NULL, NULL);
+				if (SUCCEEDED(hr) && docVar.vt == VT_DISPATCH && docVar.pdispVal != NULL)
+				{
+					OLECHAR nameProp[] = L"Name";
+					LPOLESTR pNameProp = nameProp;
+					DISPID dispidName = DISPID_UNKNOWN;
+					hr = docVar.pdispVal->GetIDsOfNames(IID_NULL, &pNameProp, 1,
+					                                    LOCALE_USER_DEFAULT, &dispidName);
+					if (SUCCEEDED(hr))
+					{
+						VARIANT nameVar;
+						VariantInit(&nameVar);
+						hr = docVar.pdispVal->Invoke(dispidName, IID_NULL, LOCALE_USER_DEFAULT,
+						                             DISPATCH_PROPERTYGET, &noArgs,
+						                             &nameVar, NULL, NULL);
+						if (SUCCEEDED(hr) && nameVar.vt == VT_BSTR && nameVar.bstrVal != NULL)
+						{
+							activeTicker = nameVar.bstrVal;
+							activeTicker.Trim();
+							bOK = !activeTicker.IsEmpty();
+						}
+						VariantClear(&nameVar);
+					}
+				}
+				VariantClear(&docVar);
+			}
+			pApp->Release();
+		}
+	}
+
+	if (bCoUninit)
+		CoUninitialize();
+
+	if (bOK)
+		return TRUE;
+#endif
+
+	if (g_bSymbolBarCacheCSInitialized)
+	{
+		EnterCriticalSection(&g_SymbolBarCacheCS);
+		activeTicker = g_LastRequestedTicker;
+		LeaveCriticalSection(&g_SymbolBarCacheCS);
+		activeTicker.Trim();
+		return !activeTicker.IsEmpty();
+	}
+
+	return FALSE;
+}
+
+BOOL IsActiveChartSymbol(const CString& ticker)
+{
+	CString activeTicker;
+	if (!GetActiveAmiBrokerSymbol(activeTicker))
+		return FALSE;
+
+	BOOL bMatch = (activeTicker.CompareNoCase(ticker) == 0);
+	if (bMatch)
+	{
+		CString log;
+		log.Format(_T("OpenAlgo: active chart symbol matched %s for refresh"), (LPCTSTR)ticker);
+		OutputDebugString(log);
+	}
+	return bMatch;
+}
+
 // GetRecentInfo is ONLY for the Realtime Quote Window + Time & Sales.
 // WS-only -- no HTTP fallback. The broker's /api/v1/quotes endpoint is
 // severely rate-limited and was driving the empty rows for slower symbols.
@@ -4315,7 +4417,7 @@ UINT __cdecl HttpWorkerThreadProc(LPVOID /*pArg*/)
 			if (nResult > 0)
 			{
 				NotifyBarsReadyForSymbol(item.ticker);
-				if (item.nForceDays > 0)
+				if (IsActiveChartSymbol(item.ticker))
 					ForceAmiBrokerRefreshAll();
 			}
 		}
