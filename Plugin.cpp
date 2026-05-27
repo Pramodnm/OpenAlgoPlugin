@@ -2419,7 +2419,15 @@ PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 {
 	AFX_MANAGE_STATE(AfxGetStaticModuleState());
 
-	if (g_nStatus != STATUS_CONNECTED || g_oApiKey.IsEmpty())
+	// Permissive: only refuse if we literally have no API key configured or
+	// the plugin is in shutdown state. Previous strict "== STATUS_CONNECTED"
+	// check returned NULL during STATUS_WAIT (before the first /ping
+	// succeeds), which meant the Quote Window stayed empty for the first
+	// several seconds after every restart, masking the data we DO have.
+	if (g_oApiKey.IsEmpty() || g_nStatus == STATUS_SHUTDOWN)
+		return NULL;
+
+	if (!g_bRecentInfoCSInit)   // Plugin not fully initialized yet
 		return NULL;
 
 	CString ticker(pszTicker);
@@ -2430,7 +2438,8 @@ PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 	// initial sends are self-healing on the next reconnect.
 	EnterCriticalSection(&g_WebSocketCriticalSection);
 	BOOL bAlready = FALSE;
-	if (!g_SubscribedSymbols.Lookup(ticker, bAlready))
+	BOOL bFreshSubscribe = !g_SubscribedSymbols.Lookup(ticker, bAlready);
+	if (bFreshSubscribe)
 	{
 		g_SubscribedSymbols.SetAt(ticker, TRUE);
 		if (g_bWebSocketConnected)
@@ -2438,11 +2447,37 @@ PLUGINAPI struct RecentInfo* GetRecentInfo(LPCTSTR pszTicker)
 	}
 	LeaveCriticalSection(&g_WebSocketCriticalSection);
 
+	struct RecentInfo* pInfo = GetOrCreateRecentInfoEntry(ticker);
+
+	// Throttled diagnostic so we can confirm in DbgView whether AmiBroker
+	// is actually polling us and what state the entry is in. First 5 calls
+	// per ticker + every 200th after that.
+	if (pInfo)
+	{
+		EnterCriticalSection(&g_RecentInfoCS);
+		static CMap<CString, LPCTSTR, int, int> s_callCounts;
+		int n = 0;
+		s_callCounts.Lookup(ticker, n);
+		n++;
+		s_callCounts.SetAt(ticker, n);
+		int bm = pInfo->nBitmap;
+		float last = pInfo->fLast;
+		LeaveCriticalSection(&g_RecentInfoCS);
+
+		if (n <= 5 || (n % 200) == 0)
+		{
+			CString log;
+			log.Format(_T("OpenAlgo: GetRecentInfo(%s) call=%d  bitmap=0x%X  last=%.2f  fresh_sub=%d"),
+				(LPCTSTR)ticker, n, bm, last, bFreshSubscribe);
+			OutputDebugString(log);
+		}
+	}
+
 	// Return the persistent per-symbol RecentInfo. It starts zeroed (nBitmap=0
 	// means "no field is valid yet"), so the Quote Window row shows empty
 	// cells until the first WS Mode 2 frame lands and the worker thread fills
 	// it in. The pointer itself is stable across all calls.
-	return GetOrCreateRecentInfoEntry(ticker);
+	return pInfo;
 }
 
 ///////////////////////////////
@@ -3524,6 +3559,25 @@ BOOL ProcessWebSocketData(void)
 						{
 							PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE,
 							            0, (LPARAM)pRI);
+						}
+
+						// Throttled diagnostic so we can confirm in DbgView
+						// that the worker thread really IS populating each
+						// subscribed symbol's RecentInfo. First 3 updates per
+						// ticker + every 200th after that.
+						{
+							static CMap<CString, LPCTSTR, int, int> s_updCounts;
+							int nu = 0;
+							s_updCounts.Lookup(ticker, nu);
+							nu++;
+							s_updCounts.SetAt(ticker, nu);
+							if (nu <= 3 || (nu % 200) == 0)
+							{
+								CString log;
+								log.Format(_T("OpenAlgo: WS update #%d %s ltp=%.2f o=%.2f h=%.2f l=%.2f c=%.2f v=%.0f bm=0x%X"),
+									nu, (LPCTSTR)ticker, ltp, open, high, low, close, volume, bm);
+								OutputDebugString(log);
+							}
 						}
 					}
 
