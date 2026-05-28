@@ -858,14 +858,31 @@ BOOL ProcessWebSocketData(void)
 				continue;
 			}
 
-			// Detect market-data frames by structural presence of the core tick
-			// fields (symbol + exchange + ltp). This is whitespace-tolerant and
+			// Detect market-data frames by structural presence of symbol +
+			// exchange plus any market payload. Some brokers send depth-only
+			// bid/ask updates without ltp, and those still need to drive
+			// AmiBroker Bid/Ask Trend and Time & Sales.
+			// This is whitespace-tolerant and
 			// works whether the server emits {"type":"ltp", ...}, {"type":"quote", ...},
 			// {"type":"market_data", ...}, or {"type":"depth", ...}.
+			BOOL bHasMarketPayload =
+				data.Find(_T("\"ltp\""))       >= 0 ||
+				data.Find(_T("\"bid\""))       >= 0 ||
+				data.Find(_T("\"ask\""))       >= 0 ||
+				data.Find(_T("\"bids\""))      >= 0 ||
+				data.Find(_T("\"asks\""))      >= 0 ||
+				data.Find(_T("\"buy\""))       >= 0 ||
+				data.Find(_T("\"sell\""))      >= 0 ||
+				data.Find(_T("\"depth\""))     >= 0 ||
+				data.Find(_T("\"open\""))      >= 0 ||
+				data.Find(_T("\"volume\""))    >= 0 ||
+				data.Find(_T("\"ltq\""))       >= 0 ||
+				data.Find(_T("\"last_quantity\"")) >= 0 ||
+				data.Find(_T("\"ltt\""))       >= 0;
 			BOOL bIsMarketData = !data.IsEmpty() &&
 				data.Find(_T("\"symbol\""))   >= 0 &&
 				data.Find(_T("\"exchange\"")) >= 0 &&
-				data.Find(_T("\"ltp\""))      >= 0;
+				bHasMarketPayload;
 
 			if (bIsMarketData)
 			{
@@ -919,8 +936,24 @@ BOOL ProcessWebSocketData(void)
 				// Keep them websocket-only and use them when depth arrays are absent.
 				if (bidPx <= 0.0f)
 					bidPx = ExtractJsonFloatValue(data, _T("bid"));
+				if (bidPx <= 0.0f)
+					bidPx = ExtractJsonFloatValue(data, _T("bid_price"));
+				if (bidPx <= 0.0f)
+					bidPx = ExtractJsonFloatValue(data, _T("best_bid"));
 				if (askPx <= 0.0f)
 					askPx = ExtractJsonFloatValue(data, _T("ask"));
+				if (askPx <= 0.0f)
+					askPx = ExtractJsonFloatValue(data, _T("ask_price"));
+				if (askPx <= 0.0f)
+					askPx = ExtractJsonFloatValue(data, _T("best_ask"));
+				if (bidQty <= 0.0f)
+					bidQty = ExtractJsonFloatValue(data, _T("bid_size"));
+				if (bidQty <= 0.0f)
+					bidQty = ExtractJsonFloatValue(data, _T("bid_quantity"));
+				if (askQty <= 0.0f)
+					askQty = ExtractJsonFloatValue(data, _T("ask_size"));
+				if (askQty <= 0.0f)
+					askQty = ExtractJsonFloatValue(data, _T("ask_quantity"));
 
 				// Extract last trade quantity - try both field names
 				// Legacy format: "last_trade_quantity":100
@@ -928,6 +961,10 @@ BOOL ProcessWebSocketData(void)
 				lastTradeQty = ExtractJsonFloatValue(data, _T("ltq"));
 				if (lastTradeQty <= 0.0f)
 					lastTradeQty = ExtractJsonFloatValue(data, _T("last_trade_quantity"));
+				if (lastTradeQty <= 0.0f)
+					lastTradeQty = ExtractJsonFloatValue(data, _T("last_quantity"));
+				if (lastTradeQty <= 0.0f)
+					lastTradeQty = ExtractJsonFloatValue(data, _T("last_qty"));
 
 				// NEW: Extract timestamp (supports both Unix milliseconds and ISO 8601 string)
 				// Server sends: "timestamp":1761157800000 (Unix milliseconds, no quotes)
@@ -966,6 +1003,11 @@ BOOL ProcessWebSocketData(void)
 				BOOL bTradeFrame = (ltp > 0.0f &&
 				                    (bLtpFrame ||
 				                     (!bQuoteFrame && !bDepthFrame && lastTradeQty > 0.0f)));
+				CString tradeToken = ExtractJsonRawValue(data, _T("ltt"));
+				if (tradeToken.IsEmpty())
+					tradeToken = ExtractJsonRawValue(data, _T("last_trade_time"));
+				if (tradeToken.IsEmpty() && bLtpFrame)
+					tradeToken = timestamp;
 
 				// Throttled logging - only log every 100th tick to avoid performance impact
 				static int s_wsCounter = 0;
@@ -1017,6 +1059,8 @@ BOOL ProcessWebSocketData(void)
 						float prevLast = pRI->fLast;
 						float prevBid  = pRI->fBid;
 						float prevAsk  = pRI->fAsk;
+						int prevBidSize = pRI->iBidSize;
+						int prevAskSize = pRI->iAskSize;
 
 						int bm = pRI->nBitmap;
 						if (ltp    > 0.0f) { pRI->fLast = ltp;       bm |= RI_LAST; }
@@ -1050,20 +1094,53 @@ BOOL ProcessWebSocketData(void)
 						// nStatus drives Time & Sales row type. We compute the
 						// flags AFTER the field writes so we know exactly which
 						// values changed in THIS frame.
-						int newStatus = RI_STATUS_UPDATE | RI_STATUS_BARSREADY;
 						BOOL priceChanged = (ltp > 0.0f && ltp != prevLast);
 						// LTP mode is the websocket trade stream. Do not suppress
 						// Time & Sales rows when consecutive trades print at the
 						// same price; AmiBroker still needs RI_STATUS_TRADE.
+						static CMap<CString, LPCTSTR, CString, LPCTSTR> s_LastTradeTokens;
+						if (!bTradeFrame && ltp > 0.0f && lastTradeQty > 0.0f && !tradeToken.IsEmpty())
+						{
+							CString prevTradeToken;
+							if (!s_LastTradeTokens.Lookup(ticker, prevTradeToken) || prevTradeToken != tradeToken)
+								bTradeFrame = TRUE;
+						}
+						if (bTradeFrame && !tradeToken.IsEmpty())
+							s_LastTradeTokens.SetAt(ticker, tradeToken);
+
 						BOOL fireTrade  = bTradeFrame;
-						BOOL fireNewBid = (bidPx > 0.0f && bidPx != prevBid);
-						BOOL fireNewAsk = (askPx > 0.0f && askPx != prevAsk);
-						if (fireTrade)  newStatus |= RI_STATUS_TRADE;
-						if (fireTrade && (bm & (RI_BID | RI_ASK))) newStatus |= RI_STATUS_BIDASK;
-						if (fireNewBid) newStatus |= RI_STATUS_NEW_BID | RI_STATUS_BIDASK;
-						if (fireNewAsk) newStatus |= RI_STATUS_NEW_ASK | RI_STATUS_BIDASK;
-						pRI->nStatus = newStatus;
-						BOOL bTimeSalesEvent = (fireTrade || fireNewBid || fireNewAsk);
+						BOOL fireNewBid = (bidPx > 0.0f &&
+						                   (bidPx != prevBid ||
+						                    (bidQty > 0.0f && (int)bidQty != prevBidSize)));
+						BOOL fireNewAsk = (askPx > 0.0f &&
+						                   (askPx != prevAsk ||
+						                    (askQty > 0.0f && (int)askQty != prevAskSize)));
+						BOOL bTimeSalesEvent =
+							(ltp > 0.0f) ||
+							((bm & (RI_BID | RI_ASK)) != 0) ||
+							fireTrade ||
+							fireNewBid ||
+							fireNewAsk;
+						if (bTimeSalesEvent)
+						{
+							// AmiBroker's Bid/Ask Trend and Time & Sales windows
+							// are driven by the RecentInfo pointer notification.
+							// Match the ADK/forum pattern: mark every streaming
+							// market frame as a trade+bidask update, and add the
+							// NEW_BID/NEW_ASK detail bits when the book changed.
+							int newStatus =
+								RI_STATUS_UPDATE |
+								RI_STATUS_BIDASK |
+								RI_STATUS_TRADE |
+								RI_STATUS_BARSREADY;
+							if (fireNewBid) newStatus |= RI_STATUS_NEW_BID;
+							if (fireNewAsk) newStatus |= RI_STATUS_NEW_ASK;
+							pRI->nStatus = newStatus;
+						}
+						else if (pRI->nStatus == 0)
+						{
+							pRI->nStatus = RI_STATUS_UPDATE | RI_STATUS_BARSREADY;
+						}
 
 						// nDateUpdate / nTimeUpdate MUST be refreshed every tick
 						// and marked valid in nBitmap or AmiBroker's Quote Window
@@ -1072,7 +1149,7 @@ BOOL ProcessWebSocketData(void)
 						pRI->nDateUpdate = nowT.GetYear() * 10000 + nowT.GetMonth() * 100 + nowT.GetDay();
 						pRI->nTimeUpdate = nowT.GetHour() * 10000 + nowT.GetMinute() * 100 + nowT.GetSecond();
 						bm |= RI_DATEUPDATE;
-						if (priceChanged || fireTrade || fireNewBid || fireNewAsk)
+						if (bTimeSalesEvent)
 						{
 							pRI->nDateChange = pRI->nDateUpdate;
 							pRI->nTimeChange = pRI->nTimeUpdate;
@@ -1081,28 +1158,7 @@ BOOL ProcessWebSocketData(void)
 						pRI->nBitmap = bm;
 						LeaveCriticalSection(&g_RecentInfoCS);
 
-						if (g_hAmiBrokerWnd != NULL)
-						{
-							if (bTimeSalesEvent)
-							{
-								// T&S consumes nStatus from the RecentInfo event.
-								// Deliver synchronously so a following quote/depth
-								// frame cannot clear TRADE/BIDASK before AmiBroker
-								// reads it from the queued message.
-								SendMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE,
-								            0, (LPARAM)pRI);
-
-								EnterCriticalSection(&g_RecentInfoCS);
-								pRI->nStatus = RI_STATUS_UPDATE | RI_STATUS_BARSREADY;
-								LeaveCriticalSection(&g_RecentInfoCS);
-							}
-							else
-							{
-								// Non-event frames still refresh the Realtime Quote
-								// Window/charts without creating duplicate T&S rows.
-								PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
-							}
-						}
+						NotifyRecentInfoUpdate(pRI, bTimeSalesEvent);
 
 						// Throttled diagnostic so we can confirm in DbgView
 						// that the worker thread really IS populating each
@@ -1117,8 +1173,8 @@ BOOL ProcessWebSocketData(void)
 							if (nu <= 3 || (nu % 200) == 0)
 							{
 								CString log;
-								log.Format(_T("OpenAlgo: WS update #%d %s ltp=%.2f o=%.2f h=%.2f l=%.2f c=%.2f v=%.0f bm=0x%X"),
-									nu, (LPCTSTR)ticker, ltp, open, high, low, close, volume, bm);
+								log.Format(_T("OpenAlgo: WS update #%d %s ltp=%.2f bid=%.2f ask=%.2f o=%.2f h=%.2f l=%.2f c=%.2f v=%.0f bm=0x%X tsEvent=%d"),
+									nu, (LPCTSTR)ticker, ltp, bidPx, askPx, open, high, low, close, volume, bm, bTimeSalesEvent);
 								OutputDebugString(log);
 							}
 						}

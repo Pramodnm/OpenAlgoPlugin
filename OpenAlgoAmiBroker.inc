@@ -1108,6 +1108,23 @@ void NotifyBarsReadyForSymbol(const CString& ticker)
 	SendMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
 }
 
+void NotifyRecentInfoUpdate(struct RecentInfo* pInfo, BOOL bRealtimeEvent)
+{
+	if (g_hAmiBrokerWnd == NULL)
+		return;
+
+	// AmiBroker updates the quote window by polling GetRecentInfo(), but
+	// Bid/Ask Trend and Time & Sales require a per-symbol RecentInfo pointer
+	// in LPARAM. A catch-all WM_USER_STREAMING_UPDATE only refreshes charts.
+	if (bRealtimeEvent && pInfo != NULL)
+	{
+		SendMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, (LPARAM)pInfo);
+		return;
+	}
+
+	PostMessage(g_hAmiBrokerWnd, WM_USER_STREAMING_UPDATE, 0, 0);
+}
+
 void ForceAmiBrokerRefreshAll(void)
 {
 #ifndef _AFX_NO_OLE_SUPPORT

@@ -103,6 +103,36 @@ static int ExtractJsonIntValue(const CString& json, LPCTSTR key)
 	return _ttoi(val);
 }
 
+static CString ExtractJsonRawValue(const CString& json, LPCTSTR key)
+{
+	CString value;
+	int pos = FindJsonValueStart(json, key);
+	if (pos < 0 || pos >= json.GetLength())
+		return value;
+
+	if (json[pos] == _T('"'))
+	{
+		pos++;
+		int endPos = json.Find(_T("\""), pos);
+		if (endPos > pos)
+			value = json.Mid(pos, endPos - pos);
+		return value;
+	}
+
+	int endPos = pos;
+	while (endPos < json.GetLength() &&
+	       json[endPos] != _T(',') &&
+	       json[endPos] != _T('}') &&
+	       json[endPos] != _T(']'))
+	{
+		endPos++;
+	}
+
+	value = json.Mid(pos, endPos - pos);
+	value.Trim();
+	return value;
+}
+
 // Extract top-of-book from a Mode 3 (Depth) WS frame. sideKey is "buy"
 // or "sell" for protocol.md frames, and "bids" or "asks" for the REST-style
 // websocket docs. We want the first {price, quantity} inside that array.
