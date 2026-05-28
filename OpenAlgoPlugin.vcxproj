@@ -186,6 +186,12 @@
     <ClCompile Include="StdAfx.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="OpenAlgoAmiBroker.inc" />
+    <None Include="OpenAlgoHistory.inc" />
+    <None Include="OpenAlgoRealtimeBars.inc" />
+    <None Include="OpenAlgoUtilities.inc" />
+    <None Include="OpenAlgoWebSocket.inc" />
+    <None Include="OpenAlgoWorkers.inc" />
     <None Include="OpenAlgoPlugin.def" />
   </ItemGroup>
   <ItemGroup>
