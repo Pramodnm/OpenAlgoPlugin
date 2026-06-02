@@ -878,6 +878,8 @@ BOOL ProcessWebSocketData(void)
 				data.Find(_T("\"volume\""))    >= 0 ||
 				data.Find(_T("\"ltq\""))       >= 0 ||
 				data.Find(_T("\"last_quantity\"")) >= 0 ||
+				data.Find(_T("\"last_traded_quantity\"")) >= 0 ||
+				data.Find(_T("\"exchange_timestamp\"")) >= 0 ||
 				data.Find(_T("\"ltt\""))       >= 0;
 			BOOL bIsMarketData = !data.IsEmpty() &&
 				data.Find(_T("\"symbol\""))   >= 0 &&
@@ -965,6 +967,8 @@ BOOL ProcessWebSocketData(void)
 					lastTradeQty = ExtractJsonFloatValue(data, _T("last_quantity"));
 				if (lastTradeQty <= 0.0f)
 					lastTradeQty = ExtractJsonFloatValue(data, _T("last_qty"));
+				if (lastTradeQty <= 0.0f)
+					lastTradeQty = ExtractJsonFloatValue(data, _T("last_traded_quantity"));
 
 				// NEW: Extract timestamp (supports both Unix milliseconds and ISO 8601 string)
 				// Server sends: "timestamp":1761157800000 (Unix milliseconds, no quotes)
@@ -995,19 +999,65 @@ BOOL ProcessWebSocketData(void)
 					}
 				}
 
+				CString ticker;
+				if (!symbol.IsEmpty() && !exchange.IsEmpty())
+					ticker = symbol + _T("-") + exchange;
+
+				// Broker-agnostic trade detection. Dhan may stream standalone
+				// LTP ticks, while Zerodha often carries the latest trade in
+				// Quote/Depth/full frames. Build candles from trade evidence
+				// (ltp + trade timestamp/quantity), not from the requested mode.
+				CString tradeTimestamp = ExtractJsonRawValue(data, _T("ltt"));
+				if (tradeTimestamp.IsEmpty())
+					tradeTimestamp = ExtractJsonRawValue(data, _T("last_trade_time"));
+				if (tradeTimestamp.IsEmpty())
+					tradeTimestamp = ExtractJsonRawValue(data, _T("last_traded_time"));
+				if (tradeTimestamp.IsEmpty())
+					tradeTimestamp = ExtractJsonRawValue(data, _T("exchange_timestamp"));
+				BOOL bHasExplicitTradeTimestamp = !tradeTimestamp.IsEmpty();
+				if (tradeTimestamp.IsEmpty() && bLtpFrame)
+					tradeTimestamp = timestamp;
+
 				// LTP frames are trade ticks. Some brokers omit LTQ in this
 				// mode, so use a minimal non-zero size for AmiBroker T&S while
 				// still preserving real LTQ whenever the feed provides it.
 				if (bLtpFrame && ltp > 0.0f && lastTradeQty <= 0.0f)
 					lastTradeQty = 1.0f;
-				BOOL bTradeFrame = (ltp > 0.0f &&
-				                    (bLtpFrame ||
-				                     (!bQuoteFrame && !bDepthFrame && lastTradeQty > 0.0f)));
-				CString tradeToken = ExtractJsonRawValue(data, _T("ltt"));
-				if (tradeToken.IsEmpty())
-					tradeToken = ExtractJsonRawValue(data, _T("last_trade_time"));
-				if (tradeToken.IsEmpty() && bLtpFrame)
-					tradeToken = timestamp;
+
+				CString tradeToken = tradeTimestamp;
+				if (!tradeToken.IsEmpty())
+				{
+					CString tradeSuffix;
+					tradeSuffix.Format(_T("|%.4f|%.0f"), ltp, lastTradeQty);
+					tradeToken += tradeSuffix;
+				}
+
+				BOOL bTradeFrame = FALSE;
+				static CMap<CString, LPCTSTR, CString, LPCTSTR> s_LastCandleTradeTokens;
+				if (ltp > 0.0f)
+				{
+					BOOL bPayloadHasTradeEvidence =
+						bLtpFrame ||
+						(lastTradeQty > 0.0f && bHasExplicitTradeTimestamp);
+
+					if (bPayloadHasTradeEvidence && !tradeToken.IsEmpty() && !ticker.IsEmpty())
+					{
+						CString prevTradeToken;
+						if (!s_LastCandleTradeTokens.Lookup(ticker, prevTradeToken) ||
+						    prevTradeToken != tradeToken)
+						{
+							bTradeFrame = TRUE;
+							s_LastCandleTradeTokens.SetAt(ticker, tradeToken);
+						}
+					}
+					else if (bLtpFrame)
+					{
+						// Last-resort compatibility for feeds that send LTP-only
+						// frames without a timestamp. Do not apply this to quote
+						// or depth frames because those can be pure book updates.
+						bTradeFrame = TRUE;
+					}
+				}
 
 				// Throttled logging - only log every 100th tick to avoid performance impact
 				static int s_wsCounter = 0;
@@ -1028,9 +1078,8 @@ BOOL ProcessWebSocketData(void)
 				// frames carry full OHLC+volume. Merge into the existing cache
 				// entry so a Mode 1 tick doesn't blow away OHLC populated by
 				// the last Mode 2 quote.
-				if (!symbol.IsEmpty() && !exchange.IsEmpty())
+				if (!ticker.IsEmpty())
 				{
-					CString ticker = symbol + _T("-") + exchange;
 					QuoteCache quote;
 					g_QuoteCache.Lookup(ticker, quote);   // start from cached, if any
 
@@ -1095,19 +1144,6 @@ BOOL ProcessWebSocketData(void)
 						// flags AFTER the field writes so we know exactly which
 						// values changed in THIS frame.
 						BOOL priceChanged = (ltp > 0.0f && ltp != prevLast);
-						// LTP mode is the websocket trade stream. Do not suppress
-						// Time & Sales rows when consecutive trades print at the
-						// same price; AmiBroker still needs RI_STATUS_TRADE.
-						static CMap<CString, LPCTSTR, CString, LPCTSTR> s_LastTradeTokens;
-						if (!bTradeFrame && ltp > 0.0f && lastTradeQty > 0.0f && !tradeToken.IsEmpty())
-						{
-							CString prevTradeToken;
-							if (!s_LastTradeTokens.Lookup(ticker, prevTradeToken) || prevTradeToken != tradeToken)
-								bTradeFrame = TRUE;
-						}
-						if (bTradeFrame && !tradeToken.IsEmpty())
-							s_LastTradeTokens.SetAt(ticker, tradeToken);
-
 						BOOL fireTrade  = bTradeFrame;
 						BOOL fireNewBid = (bidPx > 0.0f &&
 						                   (bidPx != prevBid ||
@@ -1194,10 +1230,11 @@ BOOL ProcessWebSocketData(void)
 						// bucketing. Fall back to local time only if the feed
 						// omits timestamp or sends a clearly invalid value.
 						time_t tickTimestamp = time(NULL);
-						if (!timestamp.IsEmpty())
+						CString candleTimestamp = !tradeTimestamp.IsEmpty() ? tradeTimestamp : timestamp;
+						if (!candleTimestamp.IsEmpty())
 						{
 							time_t serverTime = 0;
-							if (TryParseWebSocketTimestamp(timestamp, serverTime))
+							if (TryParseWebSocketTimestamp(candleTimestamp, serverTime))
 							{
 								time_t diff = serverTime - tickTimestamp;
 								if (diff >= -1800 && diff <= 300)
@@ -1213,7 +1250,7 @@ BOOL ProcessWebSocketData(void)
 										s_lastRejectedTsLog = nowTick;
 										CString tsLog;
 										tsLog.Format(_T("OpenAlgo: rejected WS timestamp for candle alignment: %s diff=%ld sec"),
-											(LPCTSTR)timestamp, (long)diff);
+											(LPCTSTR)candleTimestamp, (long)diff);
 										OutputDebugString(tsLog);
 									}
 								}
