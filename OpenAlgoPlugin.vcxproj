@@ -104,6 +104,10 @@
       <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ws2_32.lib;wininet.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>OpenAlgoPlugin.def</ModuleDefinitionFile>
       <OutputFile>$(OutDir)OpenAlgo32.dll</OutputFile>
+      <!-- CRITICAL: AmiBroker 32-bit loader requires DllCharacteristics=0x0 to load plugins.
+           Disabling ASLR and DEP produces the required PE header flags. This is a documented
+           host-loader compatibility workaround inherent to the AmiBroker plugin API design.
+           Do NOT re-enable without first testing on target AmiBroker 32-bit instance. -->
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>false</DataExecutionPrevention>
     </Link>
@@ -128,6 +132,10 @@
       <AdditionalDependencies>kernel32.lib;user32.lib;advapi32.lib;ws2_32.lib;wininet.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>OpenAlgoPlugin.def</ModuleDefinitionFile>
       <OutputFile>$(OutDir)OpenAlgo32.dll</OutputFile>
+      <!-- CRITICAL: AmiBroker 32-bit loader requires DllCharacteristics=0x0 to load plugins.
+           Disabling ASLR and DEP produces the required PE header flags. This is a documented
+           host-loader compatibility workaround inherent to the AmiBroker plugin API design.
+           Do NOT re-enable without first testing on target AmiBroker 32-bit instance. -->
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>false</DataExecutionPrevention>
     </Link>
