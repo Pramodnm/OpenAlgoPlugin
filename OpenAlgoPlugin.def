@@ -1,3 +1,5 @@
+LIBRARY "OpenAlgo"
+
 EXPORTS
 	GetPluginInfo
 	Init
