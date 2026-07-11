@@ -1,0 +1,48 @@
+				// WebSocket connection established successfully
+				// Now send authentication message
+				CString authMsg;
+				// Build JSON: {"action":"authenticate","api_key":"<key>"}
+				authMsg = _T("{") + CString(_T("\"action\":\"authenticate\",\"api_key\":\"")) + apiKey + CString(_T("\"}"));
+				
+				if (SendWebSocketFrame(sock, authMsg))
+				{
+					// Wait for authentication response
+					char authBuffer[512];
+					int authReceived = recv(sock, authBuffer, sizeof(authBuffer) - 1, 0);
+					if (authReceived > 0)
+					{
+						authBuffer[authReceived] = '\0';
+						CString authResponse = DecodeWebSocketFrame(authBuffer, authReceived);
+						
+						// Check for success status in authentication response
+						if (authResponse.Find(_T("success")) > 0)
+						{
+							// Authentication successful, now test subscribe
+							// Build JSON: {"action":"subscribe","symbol":"RELIANCE","exchange":"NSE","mode":2}
+							CString subMsg = _T("{") + 
+								CString(_T("\"action\":\"subscribe\",")) +
+								CString(_T("\"symbol\":\"RELIANCE\",")) +
+								CString(_T("\"exchange\":\"NSE\",")) +
+								CString(_T("\"mode\":2}"));
+							
+							if (SendWebSocketFrame(sock, subMsg))
+							{
+								// Wait briefly for subscribe confirmation
+								Sleep(500);
+								
+								// Now unsubscribe
+								// Build JSON: {"action":"unsubscribe","symbol":"RELIANCE","exchange":"NSE","mode":2}
+								CString unsubMsg = _T("{") + 
+									CString(_T("\"action\":\"unsubscribe\",")) +
+									CString(_T("\"symbol\":\"RELIANCE\",")) +
+									CString(_T("\"exchange\":\"NSE\",")) +
+									CString(_T("\"mode\":2}"));
+								
+								if (SendWebSocketFrame(sock, unsubMsg))
+								{
+									bSuccess = TRUE; // Full test completed successfully
+								}
+							}
+						}
+					}
+				}

@@ -1,0 +1,15 @@
+LIBRARY "OpenAlgo"
+
+EXPORTS
+	GetPluginInfo
+	Init
+	Release
+	Configure
+	GetQuotes
+	GetQuotesEx
+	SetTimeBase
+	Notify
+	GetRecentInfo
+	GetSymbolLimit
+	GetStatus
+	GetExtraData
